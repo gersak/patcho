@@ -33,10 +33,12 @@
 (defmulti _upgrade (fn [topic to] [topic to]))
 (defmulti _downgrade (fn [topic to] [topic to]))
 (defmulti version (fn [topic] topic))
+(defmulti deployed-version (fn [topic] topic))
 
 (defn apply
   "Applies version patches to migrate from one version to another.
   
+  With 1 args: Migrates from 'last-deployed-version' to the topic's defined current version.
   With 2 args: Migrates from 'current' to the topic's defined current version.
   With 3 args: Migrates from 'current' to 'target' version.
   
@@ -54,6 +56,7 @@
     (apply ::my-app \"1.0.0\" \"2.0.0\")  ; Upgrade from 1.0.0 to 2.0.0
     (apply ::my-app \"2.0.0\" \"1.0.0\")  ; Downgrade from 2.0.0 to 1.0.0
     (apply ::my-app nil)                ; Upgrade from beginning to current"
+  ([topic] (apply topic (deployed-version topic)))
   ([topic current] (apply topic current (version topic)))
   ([topic current target]
    (let [current (or current "0")]
@@ -83,8 +86,8 @@
                                                  (vrs/older-or-equal? version target)
                                                  (vrs/newer? version current))
                                        :downgrade (and
-                                                   (vrs/older? version current)
-                                                   (vrs/newer-or-equal? version target)))
+                                                   (vrs/older-or-equal? version current)
+                                                   (vrs/newer? version target)))
                                  data))
                              sorted)]
          (doseq [[topic version] valid-sequence]
@@ -151,6 +154,27 @@
       (read-version-from-file))"
   [topic & body]
   `(defmethod version ~topic
+     [~'_]
+     ~@body))
+
+(defmacro previous-version
+  "Defines the last installed version for a topic.
+  
+  This version is used when calling apply
+  with only 1 arguments.
+  
+  Arguments:
+    topic   - Keyword identifying the module/component
+    body    - Should return a version string
+    
+  Example:
+    (previous-version ::my-app \"2.5.0\")
+    
+    ; Can also compute version dynamically
+    (current-version ::my-app 
+      (read-version-from-file))"
+  [topic & body]
+  `(defmethod deployed-version ~topic
      [~'_]
      ~@body))
 

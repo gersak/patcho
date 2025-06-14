@@ -159,3 +159,24 @@
         ; Only apply patches between 2.0.0 and 3.0.0
         (patch/apply ::test-range "2.0.0" "3.0.0")
         (is (= ["3.0.0"] @executions))))))
+
+(deftest deployed-version-test
+  (testing "Deployed version functionality"
+    (patch/current-version ::test-deployed "3.0.0")
+    (patch/previous-version ::test-deployed "2.0.0")
+
+    (is (= "2.0.0" (patch/deployed-version ::test-deployed)))
+    (is (= "3.0.0" (patch/version ::test-deployed)))))
+
+(deftest single-arity-apply-test
+  (testing "Single arity apply uses deployed-version"
+    (let [executions (atom [])]
+      (patch/current-version ::test-single "2.0.0")
+      (patch/previous-version ::test-single "1.0.0")
+
+      (patch/upgrade ::test-single "2.0.0"
+                     (swap! executions conj "2.0.0"))
+
+      ; Should migrate from deployed-version (1.0.0) to current-version (2.0.0)
+      (patch/apply ::test-single)
+      (is (= ["2.0.0"] @executions)))))
