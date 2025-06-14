@@ -2,6 +2,9 @@
 
 A simple, elegant Clojure library for managing version migrations and patches.
 
+
+[![Clojars Project](https://img.shields.io/clojars/v/dev.gersak/patcho.svg)](https://clojars.org/dev.gersak/patcho)
+
 ## Overview
 
 Patcho provides a declarative way to define version upgrades and downgrades for your application or modules. It automatically determines which patches need to be applied to migrate from one version to another, executing them in the correct order.
