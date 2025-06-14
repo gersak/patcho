@@ -56,6 +56,26 @@ Add to your `deps.edn`:
 ;; Will execute: 1.0.0, 1.5.0, and 2.0.0 upgrades
 ```
 
+### Deployed Version Tracking
+
+Patcho can track what version is currently deployed separately from the target version:
+
+```clojure
+;; Define target version (what the system should be)
+(patch/current-version ::my-app "2.0.0")
+
+;; Define deployed version (what's actually installed)
+(patch/previous-version ::my-app "1.5.0")
+
+;; Automatically migrate from deployed to current version
+(patch/apply ::my-app)
+;; Migrates from 1.5.0 to 2.0.0
+
+;; Check both versions
+(patch/version ::my-app)          ;; => "2.0.0" (target)
+(patch/deployed-version ::my-app) ;; => "1.5.0" (deployed)
+```
+
 ### Multiple Topics
 
 You can manage different components independently:
@@ -92,6 +112,12 @@ You can manage different components independently:
 ```
 Defines the current/target version for a topic.
 
+#### `previous-version`
+```clojure
+(previous-version topic version-string)
+```
+Defines the currently deployed version for a topic. Used by the 1-arity `apply` function.
+
 #### `upgrade`
 ```clojure
 (upgrade topic version & body)
@@ -108,14 +134,17 @@ Defines code to execute when downgrading FROM the specified version.
 
 #### `apply`
 ```clojure
+(apply topic)
 (apply topic current-version)
 (apply topic current-version target-version)
 ```
-Applies necessary patches to migrate from `current-version` to `target-version` (or the topic's current version if not specified).
+Applies necessary patches to migrate between versions:
 
-- If `current-version` is nil or "0", starts from the beginning
-- Automatically determines upgrade vs downgrade direction
-- Executes patches in correct order
+- **1-arity**: Migrates from deployed version to current version
+- **2-arity**: Migrates from `current-version` to the topic's current version  
+- **3-arity**: Migrates from `current-version` to `target-version`
+
+If `current-version` is nil or "0", starts from the beginning. Automatically determines upgrade vs downgrade direction and executes patches in correct order.
 
 #### `available-versions`
 ```clojure
