@@ -163,7 +163,7 @@
 (deftest deployed-version-test
   (testing "Deployed version functionality"
     (patch/current-version ::test-deployed "3.0.0")
-    (patch/previous-version ::test-deployed "2.0.0")
+    (patch/installed-version ::test-deployed "2.0.0")
 
     (is (= "2.0.0" (patch/deployed-version ::test-deployed)))
     (is (= "3.0.0" (patch/version ::test-deployed)))))
@@ -172,7 +172,7 @@
   (testing "Single arity apply uses deployed-version"
     (let [executions (atom [])]
       (patch/current-version ::test-single "2.0.0")
-      (patch/previous-version ::test-single "1.0.0")
+      (patch/installed-version ::test-single "1.0.0")
 
       (patch/upgrade ::test-single "2.0.0"
                      (swap! executions conj "2.0.0"))
@@ -180,3 +180,123 @@
       ; Should migrate from deployed-version (1.0.0) to current-version (2.0.0)
       (patch/apply ::test-single)
       (is (= ["2.0.0"] @executions)))))
+
+;;; VersionStore tests
+
+(deftest atom-version-store-test
+  (testing "AtomVersionStore read and write"
+    (let [store (patch/->AtomVersionStore (atom {}))]
+      (testing "Read non-existent version returns '0'"
+        (is (= "0" (patch/read-version store ::test-atom-store))))
+
+      (testing "Write and read version"
+        (patch/write-version store ::test-atom-store "1.5.0")
+        (is (= "1.5.0" (patch/read-version store ::test-atom-store))))
+
+      (testing "Multiple topics in same store"
+        (patch/write-version store ::app1 "2.0.0")
+        (patch/write-version store ::app2 "3.0.0")
+        (is (= "2.0.0" (patch/read-version store ::app1)))
+        (is (= "3.0.0" (patch/read-version store ::app2)))))))
+
+(deftest file-version-store-test
+  (testing "FileVersionStore read and write"
+    (let [temp-file (java.io.File/createTempFile "patcho-test" ".edn")
+          file-path (.getAbsolutePath temp-file)
+          store (patch/->FileVersionStore file-path)]
+      (try
+        (testing "Read non-existent file returns '0'"
+          (.delete temp-file)
+          (is (= "0" (patch/read-version store ::test-file-store))))
+
+        (testing "Write and read version"
+          (patch/write-version store ::test-file-store "1.0.0")
+          (is (= "1.0.0" (patch/read-version store ::test-file-store))))
+
+        (testing "Persistence across store instances"
+          (let [store2 (patch/->FileVersionStore file-path)]
+            (is (= "1.0.0" (patch/read-version store2 ::test-file-store)))))
+
+        (testing "Multiple topics in same file"
+          (patch/write-version store ::db "2.5.0")
+          (patch/write-version store ::api "3.1.0")
+          (is (= "1.0.0" (patch/read-version store ::test-file-store)))
+          (is (= "2.5.0" (patch/read-version store ::db)))
+          (is (= "3.1.0" (patch/read-version store ::api))))
+
+        (finally
+          (.delete temp-file))))))
+
+(deftest apply-with-store-test
+  (testing "Apply automatically persists version to store"
+    (let [store (patch/->AtomVersionStore (atom {}))
+          executions (atom [])]
+      (patch/set-store! ::test-with-store store)
+      (patch/current-version ::test-with-store "3.0.0")
+      (patch/installed-version ::test-with-store (patch/read-version store ::test-with-store))
+
+      (patch/upgrade ::test-with-store "1.0.0"
+                     (swap! executions conj "1.0.0"))
+      (patch/upgrade ::test-with-store "2.0.0"
+                     (swap! executions conj "2.0.0"))
+      (patch/upgrade ::test-with-store "3.0.0"
+                     (swap! executions conj "3.0.0"))
+
+      (testing "Store starts at 0"
+        (is (= "0" (patch/read-version store ::test-with-store))))
+
+      (testing "After apply, store is updated to target version"
+        (patch/apply ::test-with-store)
+        (is (= "3.0.0" (patch/read-version store ::test-with-store)))
+        (is (= ["1.0.0" "2.0.0" "3.0.0"] @executions)))
+
+      (testing "Subsequent apply does nothing (versions equal)"
+        (reset! executions [])
+        (patch/apply ::test-with-store)
+        (is (= [] @executions))
+        (is (= "3.0.0" (patch/read-version store ::test-with-store)))))))
+
+(deftest scoped-store-with-binding-test
+  (testing "with-store macro provides scoped store"
+    (let [global-store (patch/->AtomVersionStore (atom {}))
+          scoped-store (patch/->AtomVersionStore (atom {}))
+          executions (atom [])]
+      (patch/set-store! ::test-scoped global-store)
+      (patch/current-version ::test-scoped "2.0.0")
+      (patch/installed-version ::test-scoped
+                               (or (patch/read-version global-store ::test-scoped) "0"))
+
+      (patch/upgrade ::test-scoped "1.0.0"
+                     (swap! executions conj "1.0.0"))
+      (patch/upgrade ::test-scoped "2.0.0"
+                     (swap! executions conj "2.0.0"))
+
+      (testing "Scoped store is used instead of global"
+        (patch/with-store scoped-store
+          (patch/apply ::test-scoped))
+
+        (is (= "2.0.0" (patch/read-version scoped-store ::test-scoped)))
+        (is (= "0" (patch/read-version global-store ::test-scoped))))
+
+      (testing "Global store is used outside with-store"
+        (reset! executions [])
+        (patch/apply ::test-scoped)
+        (is (= "2.0.0" (patch/read-version global-store ::test-scoped)))))))
+
+(deftest installed-version-from-store-test
+  (testing "installed-version can read from store dynamically"
+    (let [store (patch/->AtomVersionStore (atom {::test-dynamic "1.5.0"}))
+          executions (atom [])]
+      (patch/current-version ::test-dynamic "3.0.0")
+      (patch/installed-version ::test-dynamic (patch/read-version store ::test-dynamic))
+
+      (patch/upgrade ::test-dynamic "2.0.0"
+                     (swap! executions conj "2.0.0"))
+      (patch/upgrade ::test-dynamic "3.0.0"
+                     (swap! executions conj "3.0.0"))
+
+      (testing "Reads 1.5.0 from store and migrates to 3.0.0"
+        (patch/set-store! ::test-dynamic store)
+        (patch/apply ::test-dynamic)
+        (is (= ["2.0.0" "3.0.0"] @executions))
+        (is (= "3.0.0" (patch/read-version store ::test-dynamic)))))))

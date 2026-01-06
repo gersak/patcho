@@ -30,6 +30,101 @@
   (:require
    [version-clj.core :as vrs]))
 
+;;; Protocol for version persistence
+
+(defprotocol VersionStore
+  "Protocol for persisting version state across application restarts"
+  (read-version [this topic]
+    "Read the currently installed version for the given topic.
+     Should return a version string or nil/\"0\" if not found.")
+  (write-version [this topic version]
+    "Persist the installed version for the given topic.
+     Called automatically by apply after successful migration."))
+
+;;; Built-in VersionStore implementations
+
+(deftype FileVersionStore [file-path]
+  VersionStore
+  (read-version [_ topic]
+    (try
+      (or (some-> file-path slurp read-string (get topic)) "0")
+      (catch Exception _ "0")))
+  (write-version [_ topic version]
+    (let [current (try (some-> file-path slurp read-string)
+                       (catch Exception _ {}))]
+      (spit file-path (pr-str (assoc current topic version))))))
+
+(deftype AtomVersionStore [state-atom]
+  VersionStore
+  (read-version [_ topic]
+    (get @state-atom topic "0"))
+  (write-version [_ topic version]
+    (swap! state-atom assoc topic version)))
+
+;;; Store management
+
+(def ^:dynamic *version-store*
+  "Dynamic var for scoped version store. Overrides global registry when bound."
+  nil)
+
+(defonce ^:private version-stores (atom {}))
+
+(defn set-store!
+  "Register a version store for a topic globally.
+   This store will be used by apply to persist version changes.
+
+   Arguments:
+     topic - Keyword identifying the module/component
+     store - Implementation of VersionStore protocol
+
+   Example:
+     (set-store! ::my-app (->FileVersionStore \"versions.edn\"))"
+  [topic store]
+  (swap! version-stores assoc topic store))
+
+(defn set-default-store!
+  "Set a default version store for ALL topics.
+   This sets the root binding of *version-store*, so it applies globally
+   to any topic that doesn't have a specific store registered via set-store!
+
+   Arguments:
+     store - Implementation of VersionStore protocol
+
+   Example:
+     ; Use one store for everything
+     (set-default-store! (->FileVersionStore \"versions.edn\"))
+
+     ; Now all topics will use this store automatically
+     (apply ::my-app)
+     (apply ::my-db)
+     (apply ::my-api)"
+  [store]
+  (alter-var-root #'*version-store* (constantly store)))
+
+(defn- get-store
+  "Get the version store for a topic. Checks dynamic var first, then global registry."
+  [topic]
+  (or *version-store*
+      (get @version-stores topic)))
+
+(defmacro with-store
+  "Execute body with a specific VersionStore bound to *version-store*.
+   This overrides any globally registered stores within the scope.
+
+   Arguments:
+     store - Implementation of VersionStore protocol
+     body  - Expressions to execute with the store bound
+
+   Example:
+     (with-store (->FileVersionStore \"versions.edn\")
+       (apply ::my-app)
+       (apply ::other-app))"
+  [store & body]
+  `(binding [*version-store* ~store]
+     ~@body))
+
+;;; Core multimethods
+
 (defmulti _upgrade (fn [topic to] [topic to]))
 (defmulti _downgrade (fn [topic to] [topic to]))
 (defmulti version (fn [topic] topic))
@@ -37,26 +132,43 @@
 
 (defn apply
   "Applies version patches to migrate from one version to another.
-  
-  With 1 args: Migrates from 'last-deployed-version' to the topic's defined current version.
-  With 2 args: Migrates from 'current' to the topic's defined current version.
+
+  With 1 arg:  Migrates from deployed-version to the topic's current version.
+  With 2 args: Migrates from 'current' to the topic's current version.
   With 3 args: Migrates from 'current' to 'target' version.
-  
+
+  After successful migration, if a VersionStore is registered for this topic
+  (via set-store! or *version-store*), the new version is persisted automatically.
+
   Arguments:
     topic   - Keyword identifying the module/component to patch
-    current - Current version string (nil or \"0\" means start from beginning)  
+    current - Current version string (nil or \"0\" means start from beginning)
     target  - Target version string (optional, defaults to topic's current version)
-    
+
   The function automatically:
     - Determines upgrade vs downgrade direction
     - Finds applicable patches between versions
     - Executes patches in correct order (oldest-first for upgrades, newest-first for downgrades)
-    
+    - Persists the new version to the registered VersionStore (if configured)
+
+  Returns:
+    The target version if patches were applied, nil otherwise
+
   Example:
     (apply ::my-app \"1.0.0\" \"2.0.0\")  ; Upgrade from 1.0.0 to 2.0.0
     (apply ::my-app \"2.0.0\" \"1.0.0\")  ; Downgrade from 2.0.0 to 1.0.0
     (apply ::my-app nil)                ; Upgrade from beginning to current"
-  ([topic] (apply topic (deployed-version topic)))
+  ([topic]
+   ;; Handle missing deployed-version gracefully
+   (let [store (get-store topic)
+         current (try
+                   (deployed-version topic)
+                   (catch IllegalArgumentException _
+                     ;; No installed-version defined, try store or default to "0"
+                     (if store
+                       (read-version store topic)
+                       "0")))]
+     (apply topic current)))
   ([topic current] (apply topic current (version topic)))
   ([topic current target]
    (let [current (or current "0")]
@@ -93,7 +205,13 @@
          (doseq [[topic version] valid-sequence]
            (case patch-direction
              :upgrade (_upgrade topic version)
-             :downgrade (_downgrade topic version))))))))
+             :downgrade (_downgrade topic version)))
+
+         ;; After successful migration, persist the new version
+         (when-let [store (get-store topic)]
+           (write-version store topic target))
+
+         target)))))
 
 (defmacro upgrade
   "Defines code to execute when upgrading TO the specified version.
@@ -157,22 +275,27 @@
      [~'_]
      ~@body))
 
-(defmacro previous-version
-  "Defines the last installed version for a topic.
-  
-  This version is used when calling apply
-  with only 1 arguments.
-  
+(defmacro installed-version
+  "Defines the currently installed/deployed version for a topic.
+
+  This version is used as the starting point when calling apply with only 1 argument.
+  Can be a static version string or a dynamic expression (like reading from a store).
+
   Arguments:
-    topic   - Keyword identifying the module/component
-    body    - Should return a version string
-    
-  Example:
-    (previous-version ::my-app \"2.5.0\")
-    
-    ; Can also compute version dynamically
-    (current-version ::my-app 
-      (read-version-from-file))"
+    topic - Keyword identifying the module/component
+    body  - Expression(s) that return a version string
+
+  Examples:
+    ; Static version
+    (installed-version ::my-app \"1.5.0\")
+
+    ; Read from a VersionStore
+    (def store (->FileVersionStore \"versions.edn\"))
+    (installed-version ::my-app (read-version store ::my-app))
+
+    ; Read from a file directly
+    (installed-version ::my-app
+      (some-> \"version.txt\" slurp str/trim))"
   [topic & body]
   `(defmethod deployed-version ~topic
      [~'_]
@@ -180,16 +303,16 @@
 
 (defn available-versions
   "Returns a map of topics to their current versions.
-  
+
   With no args: Returns all registered topic versions.
   With args: Returns versions only for specified topics.
-  
+
   Arguments:
     topics - Zero or more topic keywords to query
-    
+
   Returns:
     Map of {topic version-string} for registered topics
-    
+
   Example:
     (available-versions)                    ; => {:app \"2.0.0\" :db \"1.5.0\"}
     (available-versions :app)               ; => {:app \"2.0.0\"}
@@ -202,6 +325,97 @@
     (if (empty? topics)
       (methods version)
       (select-keys (methods version) topics)))))
+
+(defn registered-topics
+  "Returns a set of all registered topics (components with current-version defined).
+
+  Returns:
+    Set of topic keywords
+
+  Example:
+    (registered-topics)  ; => #{:synticity/iam :synticity/iam-audit :synticity/dataset}"
+  []
+  (set (keys (methods version))))
+
+(defn level!
+  "Apply all pending patches for a component with logging.
+
+  This is a convenience wrapper around apply that:
+  - Reads the installed version from the registered VersionStore
+  - Applies all pending patches up to current-version
+  - Automatically persists the new version
+  - Provides consistent logging across all components
+
+  Arguments:
+    topic - Keyword identifying the module/component
+
+  Returns:
+    The target version if patches were applied, nil otherwise
+
+  Example:
+    ; Instead of writing custom level-X! functions:
+    (defn level-iam! []
+      (log/info \"[IAM] Leveling...\")
+      (apply :synticity/iam)
+      (log/info \"Done\"))
+
+    ; Just use:
+    (level! :synticity/iam)"
+  ([topic]
+   (let [store (get-store topic)
+         ;; Handle topics that don't have installed-version defined
+         current (try
+                   (deployed-version topic)
+                   (catch IllegalArgumentException _
+                     ;; No installed-version defined, try store or default to "0"
+                     (if store
+                       (read-version store topic)
+                       "0")))
+         target (version topic)]
+     ;; Only log and apply if there's actually work to do
+     (if (or (vrs/older? target current)
+             (vrs/newer? target current))
+       (do
+         (println (format "[%s] Leveling component from %s to %s..."
+                          (name topic) current target))
+         (apply topic)
+         (println (format "[%s] Component leveled to %s"
+                          (name topic)
+                          (if store
+                            (read-version store topic)
+                            target)))
+         target)
+       (do
+         (println (format "[%s] Already at version %s" (name topic) current))
+         nil))))
+  ([topic & more-topics]
+   (doseq [t (cons topic more-topics)]
+     (level! t))))
+
+(defn level-all!
+  "Level all registered components in registration order.
+
+  This function discovers all topics that have been registered via current-version
+  and levels each one by calling level!
+
+  Returns:
+    Map of {topic version} for components that were actually updated
+
+  Example:
+    ; Level all components at once
+    (level-all!)
+    ; => {:synticity/iam \"1.0.0\" :synticity/iam-audit \"1.0.0\"}"
+  []
+  (println "Leveling all registered components...")
+  (let [results (reduce
+                 (fn [acc topic]
+                   (if-let [new-version (level! topic)]
+                     (assoc acc topic new-version)
+                     acc))
+                 {}
+                 (registered-topics))]
+    (println (format "Leveling complete. Updated %d component(s)" (count results)))
+    results))
 
 (comment
   (vrs/newer? "0" "0.0.0")
