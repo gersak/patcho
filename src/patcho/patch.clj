@@ -64,61 +64,41 @@
 ;;; Store management
 
 (def ^:dynamic *version-store*
-  "Dynamic var for scoped version store. Overrides global registry when bound."
-  nil)
+  "Dynamic var for the version store.
 
-(defonce ^:private version-stores (atom {}))
-
-(defn set-store!
-  "Register a version store for a topic globally.
-   This store will be used by apply to persist version changes.
-
-   Arguments:
-     topic - Keyword identifying the module/component
-     store - Implementation of VersionStore protocol
-
-   Example:
-     (set-store! ::my-app (->FileVersionStore \"versions.edn\"))"
-  [topic store]
-  (swap! version-stores assoc topic store))
+  Defaults to FileVersionStore with `.versions` file.
+  Set globally via set-default-store!, or temporarily via with-store macro."
+  (->FileVersionStore ".versions"))
 
 (defn set-default-store!
-  "Set a default version store for ALL topics.
-   This sets the root binding of *version-store*, so it applies globally
-   to any topic that doesn't have a specific store registered via set-store!
+  "Set the default version store globally.
+
+  This sets the root binding of *version-store* for all patching operations.
 
    Arguments:
      store - Implementation of VersionStore protocol
 
    Example:
-     ; Use one store for everything
-     (set-default-store! (->FileVersionStore \"versions.edn\"))
+     (set-default-store! (->FileVersionStore \".versions\"))
 
-     ; Now all topics will use this store automatically
-     (apply ::my-app)
-     (apply ::my-db)
-     (apply ::my-api)"
+     (apply ::my-app)    ; Uses the default store
+     (level! ::my-db)    ; Uses the default store"
   [store]
   (alter-var-root #'*version-store* (constantly store)))
 
-(defn- get-store
-  "Get the version store for a topic. Checks dynamic var first, then global registry."
-  [topic]
-  (or *version-store*
-      (get @version-stores topic)))
-
 (defmacro with-store
   "Execute body with a specific VersionStore bound to *version-store*.
-   This overrides any globally registered stores within the scope.
+
+   Useful for testing or temporary overrides.
 
    Arguments:
      store - Implementation of VersionStore protocol
      body  - Expressions to execute with the store bound
 
    Example:
-     (with-store (->FileVersionStore \"versions.edn\")
+     (with-store (->FileVersionStore \".test-versions\")
        (apply ::my-app)
-       (apply ::other-app))"
+       (level! ::other-app))"
   [store & body]
   `(binding [*version-store* ~store]
      ~@body))
@@ -160,13 +140,12 @@
     (apply ::my-app nil)                ; Upgrade from beginning to current"
   ([topic]
    ;; Handle missing deployed-version gracefully
-   (let [store (get-store topic)
-         current (try
+   (let [current (try
                    (deployed-version topic)
                    (catch IllegalArgumentException _
                      ;; No installed-version defined, try store or default to "0"
-                     (if store
-                       (read-version store topic)
+                     (if *version-store*
+                       (read-version *version-store* topic)
                        "0")))]
      (apply topic current)))
   ([topic current] (apply topic current (version topic)))
@@ -208,8 +187,8 @@
              :downgrade (_downgrade topic version)))
 
          ;; After successful migration, persist the new version
-         (when-let [store (get-store topic)]
-           (write-version store topic target))
+         (when *version-store*
+           (write-version *version-store* topic target))
 
          target)))))
 
@@ -362,14 +341,13 @@
     ; Just use:
     (level! :synticity/iam)"
   ([topic]
-   (let [store (get-store topic)
-         ;; Handle topics that don't have installed-version defined
+   (let [;; Handle topics that don't have installed-version defined
          current (try
                    (deployed-version topic)
                    (catch IllegalArgumentException _
                      ;; No installed-version defined, try store or default to "0"
-                     (if store
-                       (read-version store topic)
+                     (if *version-store*
+                       (read-version *version-store* topic)
                        "0")))
          target (version topic)]
      ;; Only log and apply if there's actually work to do
@@ -381,8 +359,8 @@
          (apply topic)
          (println (format "[%s] Component leveled to %s"
                           (name topic)
-                          (if store
-                            (read-version store topic)
+                          (if *version-store*
+                            (read-version *version-store* topic)
                             target)))
          target)
        (do
