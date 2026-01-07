@@ -93,16 +93,15 @@
   - Functions not protocols: Simple, direct
   - Minimal dependencies: Just clojure.core"
   (:require
-   [clojure.string :as str]))
+    [clojure.set :as set]
+    [clojure.string :as str]))
 
 ;;; ============================================================================
 ;;; Registry
 ;;; ============================================================================
 
-(def ^{:private true
-       :once true}
-  modules
-  "Registry of all registered modules.
+(defonce ^{:private true
+           :doc "Registry of all registered modules.
 
   Structure:
     {topic-keyword {:depends-on [...]
@@ -110,7 +109,12 @@
                     :cleanup fn
                     :start fn
                     :stop fn
-                    :started? (atom false)}}"
+                    :started? (atom false)}}"}
+  modules
+  (atom {}))
+
+(def ^{:doc "Registry of module errors. Structure: {topic {:error Exception :timestamp Date}}"}
+  module-errors
   (atom {}))
 
 ;;; ============================================================================
@@ -229,7 +233,9 @@
        :cleanup (fn [] (drop-cache-tables!))
        :start (fn [] (start-cache!))
        :stop (fn [] (stop-cache!))})"
-  [topic {:keys [depends-on setup cleanup start stop]}]
+  [topic {:keys [depends-on setup cleanup start stop]
+          :or {stop (fn [] nil)
+               start (fn [] nil)}}]
   {:pre [(keyword? topic)
          (or (nil? depends-on) (vector? depends-on))
          (fn? start)
@@ -337,6 +343,7 @@
 
   This is idempotent - won't start if already started.
   Dependencies are started in correct order automatically.
+  Records errors in module-errors atom if startup fails.
 
   Parameters:
     topic - Module keyword
@@ -344,23 +351,37 @@
   Example:
     (start! :my/api)
     ;; → Starts :my/database → :my/cache → :my/api"
-  [topic]
-  (validate-module-exists topic)
-  (let [module (get @modules topic)
-        {:keys [depends-on start]} module
-        start-atom (:started? module)]
+  ([topic]
+   (validate-module-exists topic)
+   (let [module (get @modules topic)
+         {:keys [depends-on start]} module
+         start-atom (:started? module)]
 
-    ;; Validate dependencies exist
-    (validate-dependencies topic depends-on)
+     (try
+       ;; Validate dependencies exist
+       (validate-dependencies topic depends-on)
 
-    ;; RECURSIVELY start dependencies first
-    (doseq [dep depends-on]
-      (start! dep))
+       ;; RECURSIVELY start dependencies first
+       (doseq [dep depends-on]
+         (start! dep))
 
-    ;; Start this module (if not already started)
-    (when-not @start-atom
-      (start)
-      (reset! start-atom true))))
+       ;; Start this module (if not already started)
+       (when-not @start-atom
+         ;; Clear any previous error for this module
+         (swap! module-errors dissoc topic)
+         (start)
+         (reset! start-atom true))
+
+       (catch Exception e
+         ;; Record error with timestamp
+         (swap! module-errors assoc topic
+                {:error e
+                 :timestamp (java.util.Date.)})
+         ;; Re-throw to maintain existing behavior
+         (throw e)))))
+  ([topic & more-topics]
+   (doseq [t (cons topic more-topics)]
+     (start! t))))
 
 (defn stop!
   "Stop a module (NOT recursive - only stops this module).
@@ -504,15 +525,15 @@
                           {:remaining-modules (keys remaining)})))
         (let [next-topic (ffirst ready)]
           (recur
-           (conj result next-topic)
-           (dissoc remaining next-topic)
-           (reduce (fn [deg dep]
-                     (update deg dep dec))
-                   (dissoc in-degree next-topic)
-                   (mapcat (fn [[k v]]
-                             (when (some #{next-topic} (:depends-on v))
-                               [k]))
-                           remaining))))))))
+            (conj result next-topic)
+            (dissoc remaining next-topic)
+            (reduce (fn [deg dep]
+                      (update deg dep dec))
+                    (dissoc in-degree next-topic)
+                    (mapcat (fn [[k v]]
+                              (when (some #{next-topic} (:depends-on v))
+                                [k]))
+                            remaining))))))))
 
 (defn start-all!
   "Start all registered modules in dependency order.
@@ -629,7 +650,7 @@
   ([]
    (let [all-topics (set (keys @modules))
          all-deps (set (mapcat :depends-on (vals @modules)))
-         roots (clojure.set/difference all-topics all-deps)]
+         roots (set/difference all-topics all-deps)]
      (if (empty? roots)
        "(no modules registered)"
        (str/join "\n\n" (map dependency-tree-string (sort roots))))))
@@ -688,18 +709,304 @@
   []
   (let [deps (into {} (map (fn [[k v]] [k (:depends-on v)]) @modules))
         dependents (reduce-kv
-                    (fn [acc topic depends-on]
-                      (reduce (fn [a dep]
-                                (update a dep (fnil conj []) topic))
-                              acc
-                              depends-on))
-                    {}
-                    deps)]
+                     (fn [acc topic depends-on]
+                       (reduce (fn [a dep]
+                                 (update a dep (fnil conj []) topic))
+                               acc
+                               depends-on))
+                     {}
+                     deps)]
     (into {}
           (map (fn [[topic depends-on]]
                  [topic {:depends-on depends-on
                          :dependents (get dependents topic [])}])
                deps))))
+
+;;; ============================================================================
+;;; Layered Topology Visualization
+;;; ============================================================================
+
+(defn- layer-label
+  "Generate label for a layer number."
+  [layer-num total-layers]
+  (cond
+    (= layer-num 0) "Layer 0 (foundation)"
+    (= layer-num (dec total-layers)) (str "Layer " layer-num " (top-level)")
+    :else (str "Layer " layer-num)))
+
+(defn- calculate-layers
+  "Calculate dependency layers for all modules.
+
+  Returns map of {topic layer-number} where:
+  - Layer 0 = no dependencies
+  - Layer N = max(dependency layers) + 1
+
+  Uses iterative algorithm to assign layers."
+  [module-map]
+  (let [all-topics (set (keys module-map))]
+    (loop [layers {}
+           remaining all-topics]
+      (if (empty? remaining)
+        layers
+        (let [;; Find modules whose deps are all in layers already
+              ready (filter (fn [topic]
+                              (let [deps (:depends-on (module-map topic))]
+                                (every? #(contains? layers %) deps)))
+                            remaining)]
+          (if (empty? ready)
+            (throw (ex-info "Circular dependency detected"
+                            {:remaining (vec remaining)}))
+            ;; Assign layer based on max dependency layer + 1
+            (let [new-layers (reduce (fn [acc topic]
+                                       (let [deps (:depends-on (module-map topic))
+                                             max-dep-layer (if (empty? deps)
+                                                             -1
+                                                             (apply max (map layers deps)))]
+                                         (assoc acc topic (inc max-dep-layer))))
+                                     layers
+                                     ready)]
+              (recur new-layers (set/difference remaining (set ready))))))))))
+
+(defn- group-by-layer
+  "Group modules by their layer number.
+
+  Returns sorted vector of [layer-num [topics...]]."
+  [layers]
+  (->> layers
+       (group-by second)
+       (sort-by first)
+       (mapv (fn [[layer topics]]
+               [layer (sort (map first topics))]))))
+
+(defn topology-layers-string
+  "Generate layered list visualization of all modules.
+
+  Shows modules grouped by dependency depth with explicit dependencies.
+
+  Returns:
+    String with layered list visualization
+
+  Example:
+    (topology-layers-string)
+    ;; => \"Layer 0 (foundation):
+    ;;       :synticity/transit
+    ;;
+    ;;     Layer 1:
+    ;;       :synticity/database → [:synticity/transit]
+    ;;
+    ;;     Layer 2:
+    ;;       :synticity/dataset → [:synticity/database]
+    ;;
+    ;;     Layer 3:
+    ;;       :synticity/iam → [:synticity/dataset]
+    ;;       :synticity/lacinia → [:synticity/dataset]\""
+  []
+  (if (empty? @modules)
+    "(no modules registered)"
+    (let [module-map @modules
+          layers (calculate-layers module-map)
+          grouped (group-by-layer layers)
+          max-layer (apply max (map first grouped))]
+      (->> grouped
+           (map (fn [[layer-num layer-modules]]
+                  (let [label (layer-label layer-num max-layer)
+                        module-lines (map (fn [topic]
+                                            (let [deps (:depends-on (module-map topic))]
+                                              (if (empty? deps)
+                                                (str "  " topic)
+                                                (str "  " topic " → ["
+                                                     (str/join ", " deps)
+                                                     "]"))))
+                                          layer-modules)]
+                    (str label ":\n" (str/join "\n" module-lines)))))
+           (str/join "\n\n")))))
+
+(defn print-topology-layers
+  "Print layered list visualization of all modules.
+
+  Shows modules grouped by dependency depth with explicit dependencies.
+
+  Example:
+    (print-topology-layers)
+    ;; Prints:
+    ;; Layer 0 (foundation):
+    ;;   transit
+    ;;
+    ;; Layer 1:
+    ;;   database → [transit]
+    ;;
+    ;; Layer 2:
+    ;;   dataset → [database]"
+  []
+  (println (topology-layers-string)))
+
+;;; ============================================================================
+;;; System Report
+;;; ============================================================================
+
+(defn system-report
+  "Get comprehensive system status report including errors.
+
+  Returns map with:
+    :registered - Total count of registered modules
+    :started - Count of started modules
+    :stopped - Count of stopped modules
+    :modules - Map of {topic {:status :started/:stopped
+                              :depends-on [...]
+                              :dependents [...]
+                              :missing-dependencies [...]
+                              :error {:message \"...\"
+                                      :timestamp Date
+                                      :exception Exception}}}
+
+  Example:
+    (system-report)
+    ;=> {:registered 7
+         :started 3
+         :stopped 4
+         :modules {:synticity/transit {:status :started ...}
+                   :synticity/admin {:status :stopped
+                                     :error {:message \"No such var: db/*db*\"
+                                             :timestamp #inst \"2026-01-07\"
+                                             :exception #<ExceptionInfo ...>}}}}}"
+  []
+  (let [all-modules (registered-modules)
+        started (set (started-modules))
+        graph (dependency-graph)
+        errors @module-errors
+
+        modules-data (into {}
+                           (map (fn [topic]
+                                  (let [info (module-info topic)
+                                        deps (:depends-on info)
+                                        all-registered (set all-modules)
+                                        missing-deps (remove all-registered deps)
+                                        error-info (get errors topic)]
+                                    [topic (cond-> {:status (if (started? topic) :started :stopped)
+                                                    :depends-on deps
+                                                    :dependents (get-in graph [topic :dependents] [])}
+                                             (seq missing-deps)
+                                             (assoc :missing-dependencies (vec missing-deps))
+
+                                             error-info
+                                             (assoc :error {:message (.getMessage (:error error-info))
+                                                            :timestamp (:timestamp error-info)
+                                                            :exception (:error error-info)}))]))
+                                all-modules))]
+    {:registered (count all-modules)
+     :started (count started)
+     :stopped (- (count all-modules) (count started))
+     :modules modules-data}))
+
+(defn- format-exception
+  "Format exception for printing with message, ex-data, and abbreviated stack trace."
+  [exception]
+  (let [message (.getMessage exception)
+        cause (when-let [c (.getCause exception)] (.getMessage c))
+        ex-data (when (instance? clojure.lang.ExceptionInfo exception)
+                  (ex-data exception))
+        stack-trace (take 5 (.getStackTrace exception))]
+    (str/join "\n"
+              (remove nil?
+                      [(str "     Message: " message)
+                       (when cause (str "     Cause: " cause))
+                       (when ex-data (str "     Data: " (pr-str ex-data)))
+                       (when (seq stack-trace)
+                         (str "     Stack trace (top 5 frames):\n"
+                              (str/join "\n"
+                                        (map #(str "       " %) stack-trace))))]))))
+
+(defn print-system-report
+  "Print formatted system status report showing started/stopped modules and errors.
+
+  Uses markers:
+    [OK] - Started modules
+    [ ]  - Stopped modules (ready to start)
+    [!]  - Modules with errors or missing dependencies
+
+  Example:
+    (print-system-report)
+    ;; === System Report ===
+    ;; Registered: 7 | Started: 3 | Stopped: 4
+    ;;
+    ;; [OK] Started modules:
+    ;;   * :synticity/transit
+    ;;   * :synticity/database -> [:synticity/transit]
+    ;;
+    ;; [ ] Stopped modules (ready to start):
+    ;;   * :synticity/iam -> [:synticity/dataset]
+    ;;
+    ;; [!] Modules with errors:
+    ;;   * :synticity/admin -> [:synticity/dataset]
+    ;;     ERROR at 2026-01-07 18:23:45
+    ;;     Message: No such var: db/*db*
+    ;;     Data: {:module :synticity/admin}"
+  []
+  (let [{:keys [registered started stopped modules]} (system-report)
+        started-modules (filter #(= :started (get-in modules [% :status])) (keys modules))
+        stopped-modules (filter #(= :stopped (get-in modules [% :status])) (keys modules))
+        modules-with-errors (filter #(get-in modules [% :error]) (keys modules))
+        modules-with-missing-deps (filter #(seq (get-in modules [% :missing-dependencies])) (keys modules))]
+
+    (println "=== System Report ===")
+    (println (str "Registered: " registered
+                  " | Started: " started
+                  " | Stopped: " stopped
+                  (when (or (seq modules-with-errors)
+                            (seq modules-with-missing-deps))
+                    " | Issues detected")))
+
+    ;; Started modules
+    (when (seq started-modules)
+      (println "\n[OK] Started modules:")
+      (doseq [topic (sort started-modules)]
+        (let [deps (get-in modules [topic :depends-on])]
+          (println (str "  * " topic
+                        (when (seq deps)
+                          (str " -> [" (str/join ", " deps) "]")))))))
+
+    ;; Stopped modules (without errors)
+    (let [stopped-ok (remove (set modules-with-errors) stopped-modules)]
+      (when (seq stopped-ok)
+        (println "\n[ ] Stopped modules (ready to start):")
+        (doseq [topic (sort stopped-ok)]
+          (let [deps (get-in modules [topic :depends-on])]
+            (println (str "  * " topic
+                          (when (seq deps)
+                            (str " -> [" (str/join ", " deps) "]"))))))))
+
+    ;; Modules with errors
+    (when (seq modules-with-errors)
+      (println "\n[!] Modules with errors:")
+      (doseq [topic (sort modules-with-errors)]
+        (let [deps (get-in modules [topic :depends-on])
+              error (get-in modules [topic :error])]
+          (println (str "  * " topic
+                        (when (seq deps)
+                          (str " -> [" (str/join ", " deps) "]"))))
+          (println (str "    ERROR at " (:timestamp error)))
+          (println (str/join "\n" (map #(str "    " %)
+                                       (str/split (format-exception (:exception error)) #"\n")))))))
+
+    ;; Missing dependencies
+    (when (seq modules-with-missing-deps)
+      (println "\n[!] Missing dependencies:")
+      (doseq [topic (sort modules-with-missing-deps)]
+        (let [missing (get-in modules [topic :missing-dependencies])]
+          (println (str "  * " topic " depends on "
+                        (str/join ", " missing)
+                        " (not registered)")))))))
+
+(defn clear-errors!
+  "Clear all recorded module errors.
+
+  Useful after fixing issues and before retrying startup.
+
+  Example:
+    (clear-errors!)
+    (start! :my/module)  ; Fresh start without old errors"
+  []
+  (reset! module-errors {}))
 
 ;;; ============================================================================
 ;;; Testing Utilities
