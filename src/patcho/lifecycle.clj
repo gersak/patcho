@@ -44,7 +44,7 @@
           [patcho.lifecycle :as lifecycle]))
 
       ;; Set default store once (typically in main or init)
-      (lifecycle/set-default-store! (lifecycle/->FileLifecycleStore \".lifecycle\"))
+      (lifecycle/set-store! (lifecycle/->FileLifecycleStore \".lifecycle\"))
 
       ;; One-time setup (RECURSIVE - handles all dependencies)
       (lifecycle/setup! :my/api)
@@ -93,8 +93,9 @@
   - Functions not protocols: Simple, direct
   - Minimal dependencies: Just clojure.core"
   (:require
-    [clojure.set :as set]
-    [clojure.string :as str]))
+   [clojure.java.io :as io]
+   [clojure.set :as set]
+   [clojure.string :as str]))
 
 ;;; ============================================================================
 ;;; Registry
@@ -137,18 +138,20 @@
 ;;; File-based LifecycleStore
 ;;; ============================================================================
 
-(defn- read-edn-file [file-path]
+(defn- read-edn-file
   "Read EDN file, return empty map if doesn't exist."
+  [file-path]
   (try
-    (let [file (clojure.java.io/file file-path)]
+    (let [file (io/file file-path)]
       (if (.exists file)
         (read-string (slurp file))
         {}))
     (catch Exception _
       {})))
 
-(defn- write-edn-file [file-path data]
+(defn- write-edn-file
   "Write data to EDN file."
+  [file-path data]
   (spit file-path (pr-str data)))
 
 (defrecord FileLifecycleStore [file-path]
@@ -168,10 +171,10 @@
   "Dynamic var for the lifecycle store.
 
   Defaults to FileLifecycleStore with `.lifecycle` file.
-  Set globally via set-default-store!, or temporarily via with-store macro."
+  Set globally via set-store!, or temporarily via with-store macro."
   (->FileLifecycleStore ".lifecycle"))
 
-(defn set-default-store!
+(defn set-store!
   "Set the default lifecycle store globally.
 
   This sets the root binding of *lifecycle-store* for all lifecycle operations.
@@ -180,7 +183,7 @@
      store - Implementation of LifecycleStore protocol
 
    Example:
-     (set-default-store! (->FileLifecycleStore \".lifecycle\"))
+     (set-store! (->FileLifecycleStore \".lifecycle\"))
 
      (setup! :my/app)     ; Uses the default store
      (cleanup! :my/db)    ; Uses the default store"
@@ -316,14 +319,6 @@
                        :missing-dependencies missing
                        :registered (registered-modules)})))))
 
-(defn- get-dependents
-  "Returns set of registered modules that depend on this topic."
-  [topic]
-  (set (keep (fn [[t module]]
-               (when (some #{topic} (:depends-on module))
-                 t))
-             @modules)))
-
 (defn- get-active-dependents
   "Returns set of registered modules that depend on this topic AND haven't been cleaned up yet."
   [topic]
@@ -403,23 +398,13 @@
       (stop)
       (reset! stop-atom false))))
 
-(defn setup!
-  "Run one-time setup for a module RECURSIVELY.
+(defn- setup-single!
+  "Run one-time setup for a single module RECURSIVELY.
 
-  This is idempotent - tracks if setup already ran via LifecycleStore.
-  STARTS dependencies first (setup often needs them running).
-
-  Uses *lifecycle-store* - set it via set-default-store! or with-store macro.
-
-  Parameters:
-    topic - Module keyword
-
-  Example:
-    (set-default-store! (->FileLifecycleStore \".lifecycle\"))
-    (setup! :my/cache)"
+  Internal function - use setup! instead."
   [topic]
   (when-not *lifecycle-store*
-    (throw (ex-info "No lifecycle store configured. Use set-default-store!"
+    (throw (ex-info "No lifecycle store configured. Use set-store!"
                     {:module topic})))
   (validate-module-exists topic)
   (let [module (get @modules topic)
@@ -443,6 +428,25 @@
       (write-lifecycle-state *lifecycle-store* topic
                              (assoc state :setup-complete? true)))))
 
+(defn setup!
+  "Run one-time setup for one or more modules RECURSIVELY.
+
+  This is idempotent - tracks if setup already ran via LifecycleStore.
+  STARTS dependencies first (setup often needs them running).
+
+  Uses *lifecycle-store* - set it via set-store! or with-store macro.
+
+  Parameters:
+    topics - One or more module keywords
+
+  Example:
+    (set-store! (->FileLifecycleStore \".lifecycle\"))
+    (setup! :my/cache)
+    (setup! :my/db :my/cache :my/api)"
+  [& topics]
+  (doseq [topic topics]
+    (setup-single! topic)))
+
 (defn cleanup!
   "Run one-time cleanup for a module RECURSIVELY with reference checking.
 
@@ -454,17 +458,17 @@
   - Tries to cleanup each dependency
   - Only cleans dependency if no OTHER modules depend on it
 
-  Uses *lifecycle-store* - set it via set-default-store! or with-store macro.
+  Uses *lifecycle-store* - set it via set-store! or with-store macro.
 
   Parameters:
     topic - Module keyword
 
   Example:
-    (set-default-store! (->FileLifecycleStore \".lifecycle\"))
+    (set-store! (->FileLifecycleStore \".lifecycle\"))
     (cleanup! :my/cache)"
   [topic]
   (when-not *lifecycle-store*
-    (throw (ex-info "No lifecycle store configured. Use set-default-store!"
+    (throw (ex-info "No lifecycle store configured. Use set-store!"
                     {:module topic})))
   (validate-module-exists topic)
   (let [module (get @modules topic)
@@ -525,15 +529,15 @@
                           {:remaining-modules (keys remaining)})))
         (let [next-topic (ffirst ready)]
           (recur
-            (conj result next-topic)
-            (dissoc remaining next-topic)
-            (reduce (fn [deg dep]
-                      (update deg dep dec))
-                    (dissoc in-degree next-topic)
-                    (mapcat (fn [[k v]]
-                              (when (some #{next-topic} (:depends-on v))
-                                [k]))
-                            remaining))))))))
+           (conj result next-topic)
+           (dissoc remaining next-topic)
+           (reduce (fn [deg dep]
+                     (update deg dep dec))
+                   (dissoc in-degree next-topic)
+                   (mapcat (fn [[k v]]
+                             (when (some #{next-topic} (:depends-on v))
+                               [k]))
+                           remaining))))))))
 
 (defn start-all!
   "Start all registered modules in dependency order.
@@ -578,17 +582,17 @@
   Each module's dependencies are started before its setup runs.
   Skips modules that already have setup complete.
 
-  Uses *lifecycle-store* - set it via set-default-store! or with-store macro.
+  Uses *lifecycle-store* - set it via set-store! or with-store macro.
 
   Returns:
     Vector of setup module topics in order
 
   Example:
-    (set-default-store! (->FileLifecycleStore \".lifecycle\"))
+    (set-store! (->FileLifecycleStore \".lifecycle\"))
     (setup-all!)"
   []
   (when-not *lifecycle-store*
-    (throw (ex-info "No lifecycle store configured. Use set-default-store!"
+    (throw (ex-info "No lifecycle store configured. Use set-store!"
                     {})))
   (let [sorted (topological-sort @modules)]
     (doseq [topic sorted]
@@ -709,13 +713,13 @@
   []
   (let [deps (into {} (map (fn [[k v]] [k (:depends-on v)]) @modules))
         dependents (reduce-kv
-                     (fn [acc topic depends-on]
-                       (reduce (fn [a dep]
-                                 (update a dep (fnil conj []) topic))
-                               acc
-                               depends-on))
-                     {}
-                     deps)]
+                    (fn [acc topic depends-on]
+                      (reduce (fn [a dep]
+                                (update a dep (fnil conj []) topic))
+                              acc
+                              depends-on))
+                    {}
+                    deps)]
     (into {}
           (map (fn [[topic depends-on]]
                  [topic {:depends-on depends-on

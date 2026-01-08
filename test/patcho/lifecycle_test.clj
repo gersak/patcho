@@ -8,8 +8,9 @@
 ;;; Test Fixtures
 ;;; ============================================================================
 
-(defn reset-registry-fixture [f]
+(defn reset-registry-fixture
   "Reset registry before each test."
+  [f]
   (lifecycle/reset-registry!)
   (f)
   (lifecycle/reset-registry!))
@@ -226,17 +227,27 @@
 ;;; ============================================================================
 
 (deftest setup-test
-  (testing "Setup function is called with arguments"
-    (let [setup-args (atom nil)]
-      (lifecycle/register-module! :test/setup
-                                  {:setup (fn [& args] (reset! setup-args args))
+  (testing "Setup multiple topics at once"
+    (let [setup-calls (atom [])]
+      (lifecycle/register-module! :test/setup1
+                                  {:setup (fn [] (swap! setup-calls conj :setup1))
+                                   :start (fn [] nil)
+                                   :stop (fn [] nil)})
+      (lifecycle/register-module! :test/setup2
+                                  {:setup (fn [] (swap! setup-calls conj :setup2))
+                                   :start (fn [] nil)
+                                   :stop (fn [] nil)})
+      (lifecycle/register-module! :test/setup3
+                                  {:setup (fn [] (swap! setup-calls conj :setup3))
                                    :start (fn [] nil)
                                    :stop (fn [] nil)})
 
-      (lifecycle/setup! :test/setup :arg1 :arg2 :arg3)
+      (lifecycle/setup! :test/setup1 :test/setup2 :test/setup3)
 
-      (is (= [:arg1 :arg2 :arg3] @setup-args))
-      (is (= true (:setup-complete? (lifecycle/module-info :test/setup))))))
+      (is (= [:setup1 :setup2 :setup3] @setup-calls))
+      (is (= true (:setup-complete? (lifecycle/module-info :test/setup1))))
+      (is (= true (:setup-complete? (lifecycle/module-info :test/setup2))))
+      (is (= true (:setup-complete? (lifecycle/module-info :test/setup3))))))
 
   (testing "Setup is idempotent"
     (let [setup-count (atom 0)]

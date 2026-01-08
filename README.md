@@ -94,7 +94,7 @@ The simplest approach - use one store for everything:
 (def store (patch/->FileVersionStore "versions.edn"))
 
 ;; Set as default for ALL topics
-(patch/set-default-store! store)
+(patch/set-store! store)
 
 ;; Define multiple topics - all will use the same store automatically
 (patch/current-version ::my-app "2.0.0")
@@ -285,11 +285,11 @@ Returns the target version if patches were applied, nil otherwise.
 ```
 Register a VersionStore for a specific topic. This store will be used by `apply` to persist version changes for that topic.
 
-#### `set-default-store!`
+#### `set-store!` (default for all topics)
 ```clojure
-(set-default-store! store)
+(set-store! store)
 ```
-Set a default VersionStore for ALL topics. This is the simplest approach - one store tracks versions for all your topics. The store will be used for any topic that doesn't have a specific store registered via `set-store!`.
+Set a default VersionStore for ALL topics. This is the simplest approach - one store tracks versions for all your topics. The store will be used for any topic that doesn't have a specific store registered.
 
 #### `available-versions`
 ```clojure
