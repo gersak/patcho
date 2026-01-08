@@ -28,7 +28,7 @@
     (patch/apply ::my-app nil)        ; Runs all upgrades"
   (:refer-clojure :exclude [apply])
   (:require
-    [version-clj.core :as vrs]))
+   [version-clj.core :as vrs]))
 
 ;;; Protocol for version persistence
 
@@ -71,24 +71,20 @@
   (->FileVersionStore ".versions"))
 
 (defn set-store!
-  "Set a version store.
+  "Set the default version store globally.
 
-  With 1 arg: Sets the default version store globally for ALL topics.
-  With 2 args: Sets a version store for a specific topic.
+  This sets the root binding of *version-store* for all patching operations.
 
   Arguments:
     store - Implementation of VersionStore protocol
-    topic - (Optional) Topic keyword for per-topic store
 
-  Examples:
-    ; Set default store for all topics
+  Example:
     (set-store! (->FileVersionStore \".versions\"))
 
-    ; Set per-topic store
-    (set-store! ::my-app (->FileVersionStore \"my-app.versions\"))
-    (set-store! ::my-db (->AtomVersionStore (atom {})))"
-  ([store]
-   (alter-var-root #'*version-store* (constantly store))))
+    (apply ::my-app)    ; Uses the default store
+    (level! ::my-db)    ; Uses the default store"
+  [store]
+  (alter-var-root #'*version-store* (constantly store)))
 
 (defmacro with-store
   "Execute body with a specific VersionStore bound to *version-store*.
@@ -144,57 +140,55 @@
     (apply ::my-app nil)                ; Upgrade from beginning to current"
   ([topic]
    ;; Handle missing deployed-version gracefully
-   (let [store *version-store*
-         current (try
+   (let [current (try
                    (deployed-version topic)
                    (catch IllegalArgumentException _
                      ;; No installed-version defined, try store or default to "0"
-                     (if store
-                       (read-version store topic)
+                     (if *version-store*
+                       (read-version *version-store* topic)
                        "0")))]
      (apply topic current)))
   ([topic current] (apply topic current (version topic)))
   ([topic current target]
    (let [current (or current "0")]
      (when (or
-             (vrs/older? target current)
-             (vrs/newer? target current))
+            (vrs/older? target current)
+            (vrs/newer? target current))
        (let [patch-direction (if (vrs/newer? target current)
                                :upgrade
                                :downgrade)
              patch-sequence (filter
-                              (fn [[_topic _]]
-                                (= _topic topic))
-                              (keys
-                                (methods (case patch-direction
-                                           :upgrade _upgrade
-                                           :downgrade _downgrade))))
+                             (fn [[_topic _]]
+                               (= _topic topic))
+                             (keys
+                              (methods (case patch-direction
+                                         :upgrade _upgrade
+                                         :downgrade _downgrade))))
              sorted (sort-by
-                      second
-                      (case patch-direction
-                        :upgrade vrs/older?
-                        :downgrade vrs/newer?)
-                      patch-sequence)
+                     second
+                     (case patch-direction
+                       :upgrade vrs/older?
+                       :downgrade vrs/newer?)
+                     patch-sequence)
              valid-sequence (keep
-                              (fn [[_ version :as data]]
-                                (when (case patch-direction
-                                        :upgrade (and
-                                                   (vrs/older-or-equal? version target)
-                                                   (vrs/newer? version current))
-                                        :downgrade (and
-                                                     (vrs/older-or-equal? version current)
-                                                     (vrs/newer? version target)))
-                                  data))
-                              sorted)]
+                             (fn [[_ version :as data]]
+                               (when (case patch-direction
+                                       :upgrade (and
+                                                 (vrs/older-or-equal? version target)
+                                                 (vrs/newer? version current))
+                                       :downgrade (and
+                                                   (vrs/older-or-equal? version current)
+                                                   (vrs/newer? version target)))
+                                 data))
+                             sorted)]
          (doseq [[topic version] valid-sequence]
            (case patch-direction
              :upgrade (_upgrade topic version)
              :downgrade (_downgrade topic version)))
 
          ;; After successful migration, persist the new version
-         (let [store *version-store*]
-           (when store
-             (write-version store topic target)))
+         (when *version-store*
+           (write-version *version-store* topic target))
 
          target)))))
 
@@ -304,12 +298,12 @@
     (available-versions :app :db :unknown)  ; => {:app \"2.0.0\" :db \"1.5.0\"}"
   ([& topics]
    (reduce-kv
-     (fn [r k f]
-       (assoc r k (f k)))
-     nil
-     (if (empty? topics)
-       (methods version)
-       (select-keys (methods version) topics)))))
+    (fn [r k f]
+      (assoc r k (f k)))
+    nil
+    (if (empty? topics)
+      (methods version)
+      (select-keys (methods version) topics)))))
 
 (defn registered-topics
   "Returns a set of all registered topics (components with current-version defined).
@@ -392,12 +386,12 @@
   []
   (println "Leveling all registered components...")
   (let [results (reduce
-                  (fn [acc topic]
-                    (if-let [new-version (level! topic)]
-                      (assoc acc topic new-version)
-                      acc))
-                  {}
-                  (registered-topics))]
+                 (fn [acc topic]
+                   (if-let [new-version (level! topic)]
+                     (assoc acc topic new-version)
+                     acc))
+                 {}
+                 (registered-topics))]
     (println (format "Leveling complete. Updated %d component(s)" (count results)))
     results))
 
@@ -417,5 +411,5 @@
   (vrs/newer-or-equal? "0.0.1" "0")
   (apply ::datasets nil "0.0.1")
   (macroexpand-1
-    `(upgrade ::datasets "0.3.37" (println "Patching 0.3.37")))
+   `(upgrade ::datasets "0.3.37" (println "Patching 0.3.37")))
   (group-by first (keys (methods _upgrade))))

@@ -281,15 +281,9 @@ Returns the target version if patches were applied, nil otherwise.
 
 #### `set-store!`
 ```clojure
-(set-store! topic store)
-```
-Register a VersionStore for a specific topic. This store will be used by `apply` to persist version changes for that topic.
-
-#### `set-store!` (default for all topics)
-```clojure
 (set-store! store)
 ```
-Set a default VersionStore for ALL topics. This is the simplest approach - one store tracks versions for all your topics. The store will be used for any topic that doesn't have a specific store registered.
+Set the default VersionStore globally for ALL topics. This store will be used by `apply` to persist version changes. One store tracks versions for all your topics.
 
 #### `available-versions`
 ```clojure

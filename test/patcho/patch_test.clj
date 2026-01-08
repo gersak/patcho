@@ -231,7 +231,7 @@
   (testing "Apply automatically persists version to store"
     (let [store (patch/->AtomVersionStore (atom {}))
           executions (atom [])]
-      (patch/set-store! ::test-with-store store)
+      (patch/set-store! store)
       (patch/current-version ::test-with-store "3.0.0")
       (patch/installed-version ::test-with-store (patch/read-version store ::test-with-store))
 
@@ -261,7 +261,7 @@
     (let [global-store (patch/->AtomVersionStore (atom {}))
           scoped-store (patch/->AtomVersionStore (atom {}))
           executions (atom [])]
-      (patch/set-store! ::test-scoped global-store)
+      (patch/set-store! global-store)
       (patch/current-version ::test-scoped "2.0.0")
       (patch/installed-version ::test-scoped
                                (or (patch/read-version global-store ::test-scoped) "0"))
@@ -296,7 +296,7 @@
                      (swap! executions conj "3.0.0"))
 
       (testing "Reads 1.5.0 from store and migrates to 3.0.0"
-        (patch/set-store! ::test-dynamic store)
+        (patch/set-store! store)
         (patch/apply ::test-dynamic)
         (is (= ["2.0.0" "3.0.0"] @executions))
         (is (= "3.0.0" (patch/read-version store ::test-dynamic)))))))
