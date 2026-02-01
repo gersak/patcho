@@ -1,2 +1,5 @@
 .cpcache
+.claude/
+.lsp/
+.clj-kondo/
 target/

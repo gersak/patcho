@@ -93,9 +93,9 @@
   - Functions not protocols: Simple, direct
   - Minimal dependencies: Just clojure.core"
   (:require
-   [clojure.java.io :as io]
-   [clojure.set :as set]
-   [clojure.string :as str]))
+    [clojure.java.io :as io]
+    [clojure.set :as set]
+    [clojure.string :as str]))
 
 ;;; ============================================================================
 ;;; Registry
@@ -217,7 +217,7 @@
   This should be called at namespace load time (top-level form).
 
   Parameters:
-    topic   - Keyword identifying the module (e.g., :synticity/iam)
+    topic   - Keyword identifying the module (e.g., :synthigy/iam)
     spec    - Map with keys:
               :depends-on   - Vector of topic keywords this module depends on
               :setup        - (Optional) fn taking no args for one-time setup
@@ -249,7 +249,7 @@
           :cleanup cleanup
           :start start
           :stop stop
-          :started? (atom false)})
+          :started? false})
   nil)
 
 ;;; ============================================================================
@@ -265,7 +265,7 @@
   "Returns vector of currently started module topics."
   []
   (vec (keep (fn [[topic module]]
-               (when @(:started? module) topic))
+               (when (:started? module) topic))
              @modules)))
 
 (defn module-info
@@ -283,7 +283,7 @@
   [topic]
   (when-let [module (get @modules topic)]
     (let [base-info {:depends-on (:depends-on module)
-                     :started? @(:started? module)
+                     :started? (:started? module)
                      :has-setup? (some? (:setup module))
                      :has-cleanup? (some? (:cleanup module))}]
       ;; If a store is configured, include persistent state
@@ -291,11 +291,12 @@
         (merge base-info (read-lifecycle-state *lifecycle-store* topic))
         base-info))))
 
+
 (defn started?
   "Returns true if module is currently started."
   [topic]
   (when-let [module (get @modules topic)]
-    @(:started? module)))
+    (:started? module)))
 
 ;;; ============================================================================
 ;;; Dependency Helpers
@@ -349,9 +350,7 @@
   ([topic]
    (validate-module-exists topic)
    (let [module (get @modules topic)
-         {:keys [depends-on start]} module
-         start-atom (:started? module)]
-
+         {:keys [depends-on start started?]} module]
      (try
        ;; Validate dependencies exist
        (validate-dependencies topic depends-on)
@@ -361,11 +360,11 @@
          (start! dep))
 
        ;; Start this module (if not already started)
-       (when-not @start-atom
+       (when-not started?
          ;; Clear any previous error for this module
          (swap! module-errors dissoc topic)
          (start)
-         (reset! start-atom true))
+         (swap! modules assoc-in [topic :started?] true))
 
        (catch Exception e
          ;; Record error with timestamp
@@ -411,12 +410,12 @@
         {:keys [depends-on setup]} module
         state (read-lifecycle-state *lifecycle-store* topic)]
 
-    (when-not setup
-      (throw (ex-info "Module has no setup function"
-                      {:module topic})))
-
     ;; Validate dependencies exist
     (validate-dependencies topic depends-on)
+
+    ;; Make sure that everythign is setup
+    (doseq [dep depends-on]
+      (setup-single! dep))
 
     ;; RECURSIVELY start dependencies first (setup needs them running!)
     (doseq [dep depends-on]
@@ -424,9 +423,12 @@
 
     ;; Run setup (if not already complete)
     (when-not (:setup-complete? state)
-      (setup)
+      (when (ifn? setup) (setup))
+      ;; Mark setup complete and reset cleanup-complete so cleanup can run again
       (write-lifecycle-state *lifecycle-store* topic
-                             (assoc state :setup-complete? true)))))
+                             (assoc state
+                               :setup-complete? true
+                               :cleanup-complete? false)))))
 
 (defn setup!
   "Run one-time setup for one or more modules RECURSIVELY.
@@ -447,16 +449,25 @@
   (doseq [topic topics]
     (setup-single! topic)))
 
+(defn- get-dependants
+  "Returns set of registered modules that depend on this topic."
+  [topic]
+  (set (keep (fn [[t module]]
+               (when (some #{topic} (:depends-on module))
+                 t))
+             @modules)))
+
 (defn cleanup!
-  "Run one-time cleanup for a module RECURSIVELY with reference checking.
+  "Run one-time cleanup for a module and all its dependants (modules that depend on it).
+
+  Cleanup order:
+  1. First cleanup all dependants (modules that depend on this one) - recursively
+  2. Then cleanup this module
+
+  This ensures no module is left in an inconsistent state with a missing dependency.
+  Dependencies (modules this one depends on) are NOT cleaned - they may be shared.
 
   This is idempotent - tracks if cleanup already ran via LifecycleStore.
-  Only cleans up dependencies if no other registered modules depend on them.
-
-  Reference counting (claimed-by semantics):
-  - Cleans up this module
-  - Tries to cleanup each dependency
-  - Only cleans dependency if no OTHER modules depend on it
 
   Uses *lifecycle-store* - set it via set-store! or with-store macro.
 
@@ -465,32 +476,31 @@
 
   Example:
     (set-store! (->FileLifecycleStore \".lifecycle\"))
-    (cleanup! :my/cache)"
+    (cleanup! :my/database)  ; Also cleans up :my/cache if it depends on :my/database"
   [topic]
   (when-not *lifecycle-store*
     (throw (ex-info "No lifecycle store configured. Use set-store!"
                     {:module topic})))
   (validate-module-exists topic)
+
+  ;; First, recursively cleanup all dependants (modules that depend on this one)
+  (doseq [dependant (get-dependants topic)]
+    (cleanup! dependant))
+
+  ;; Then cleanup this module (if it has a cleanup function)
+  ;; Always run cleanup - it should be idempotent (safe to run multiple times)
   (let [module (get @modules topic)
-        {:keys [depends-on cleanup]} module
-        state (read-lifecycle-state *lifecycle-store* topic)]
-
-    (when-not cleanup
-      (throw (ex-info "Module has no cleanup function"
-                      {:module topic})))
-
-    ;; Cleanup this module (if not already complete)
-    (when-not (:cleanup-complete? state)
+        {:keys [cleanup]} module]
+    (when cleanup
       (cleanup)
-      (write-lifecycle-state *lifecycle-store* topic
-                             (assoc state :cleanup-complete? true)))
-
-    ;; RECURSIVELY try to cleanup dependencies (with reference checking)
-    (doseq [dep depends-on]
-      ;; Only cleanup if no OTHER active (non-cleaned-up) modules depend on it
-      (let [active-dependents (get-active-dependents dep)]
-        (when (empty? active-dependents)
-          (cleanup! dep))))))
+      ;; Mark cleanup complete and reset setup-complete so setup can run again
+      ;; Note: we write state AFTER cleanup runs, in case cleanup deletes the store
+      (when *lifecycle-store*
+        (try
+          (write-lifecycle-state *lifecycle-store* topic
+                                 {:cleanup-complete? true
+                                  :setup-complete? false})
+          (catch Exception _ nil))))))
 
 (defn restart!
   "Restart a module (stop then start).
@@ -529,15 +539,15 @@
                           {:remaining-modules (keys remaining)})))
         (let [next-topic (ffirst ready)]
           (recur
-           (conj result next-topic)
-           (dissoc remaining next-topic)
-           (reduce (fn [deg dep]
-                     (update deg dep dec))
-                   (dissoc in-degree next-topic)
-                   (mapcat (fn [[k v]]
-                             (when (some #{next-topic} (:depends-on v))
-                               [k]))
-                           remaining))))))))
+            (conj result next-topic)
+            (dissoc remaining next-topic)
+            (reduce (fn [deg dep]
+                      (update deg dep dec))
+                    (dissoc in-degree next-topic)
+                    (mapcat (fn [[k v]]
+                              (when (some #{next-topic} (:depends-on v))
+                                [k]))
+                            remaining))))))))
 
 (defn start-all!
   "Start all registered modules in dependency order.
@@ -713,13 +723,13 @@
   []
   (let [deps (into {} (map (fn [[k v]] [k (:depends-on v)]) @modules))
         dependents (reduce-kv
-                    (fn [acc topic depends-on]
-                      (reduce (fn [a dep]
-                                (update a dep (fnil conj []) topic))
-                              acc
-                              depends-on))
-                    {}
-                    deps)]
+                     (fn [acc topic depends-on]
+                       (reduce (fn [a dep]
+                                 (update a dep (fnil conj []) topic))
+                               acc
+                               depends-on))
+                     {}
+                     deps)]
     (into {}
           (map (fn [[topic depends-on]]
                  [topic {:depends-on depends-on
@@ -793,17 +803,17 @@
   Example:
     (topology-layers-string)
     ;; => \"Layer 0 (foundation):
-    ;;       :synticity/transit
+    ;;       :synthigy/transit
     ;;
     ;;     Layer 1:
-    ;;       :synticity/database → [:synticity/transit]
+    ;;       :synthigy/database → [:synthigy/transit]
     ;;
     ;;     Layer 2:
-    ;;       :synticity/dataset → [:synticity/database]
+    ;;       :synthigy/dataset → [:synthigy/database]
     ;;
     ;;     Layer 3:
-    ;;       :synticity/iam → [:synticity/dataset]
-    ;;       :synticity/lacinia → [:synticity/dataset]\""
+    ;;       :synthigy/iam → [:synthigy/dataset]
+    ;;       :synthigy/lacinia → [:synthigy/dataset]\""
   []
   (if (empty? @modules)
     "(no modules registered)"
@@ -868,8 +878,8 @@
     ;=> {:registered 7
          :started 3
          :stopped 4
-         :modules {:synticity/transit {:status :started ...}
-                   :synticity/admin {:status :stopped
+         :modules {:synthigy/transit {:status :started ...}
+                   :synthigy/admin {:status :stopped
                                      :error {:message \"No such var: db/*db*\"
                                              :timestamp #inst \"2026-01-07\"
                                              :exception #<ExceptionInfo ...>}}}}}"
@@ -934,17 +944,17 @@
     ;; Registered: 7 | Started: 3 | Stopped: 4
     ;;
     ;; [OK] Started modules:
-    ;;   * :synticity/transit
-    ;;   * :synticity/database -> [:synticity/transit]
+    ;;   * :synthigy/transit
+    ;;   * :synthigy/database -> [:synthigy/transit]
     ;;
     ;; [ ] Stopped modules (ready to start):
-    ;;   * :synticity/iam -> [:synticity/dataset]
+    ;;   * :synthigy/iam -> [:synthigy/dataset]
     ;;
     ;; [!] Modules with errors:
-    ;;   * :synticity/admin -> [:synticity/dataset]
+    ;;   * :synthigy/admin -> [:synthigy/dataset]
     ;;     ERROR at 2026-01-07 18:23:45
     ;;     Message: No such var: db/*db*
-    ;;     Data: {:module :synticity/admin}"
+    ;;     Data: {:module :synthigy/admin}"
   []
   (let [{:keys [registered started stopped modules]} (system-report)
         started-modules (filter #(= :started (get-in modules [% :status])) (keys modules))

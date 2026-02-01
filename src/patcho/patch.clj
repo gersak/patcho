@@ -28,7 +28,7 @@
     (patch/apply ::my-app nil)        ; Runs all upgrades"
   (:refer-clojure :exclude [apply])
   (:require
-   [version-clj.core :as vrs]))
+    [version-clj.core :as vrs]))
 
 ;;; Protocol for version persistence
 
@@ -152,35 +152,35 @@
   ([topic current target]
    (let [current (or current "0")]
      (when (or
-            (vrs/older? target current)
-            (vrs/newer? target current))
+             (vrs/older? target current)
+             (vrs/newer? target current))
        (let [patch-direction (if (vrs/newer? target current)
                                :upgrade
                                :downgrade)
              patch-sequence (filter
-                             (fn [[_topic _]]
-                               (= _topic topic))
-                             (keys
-                              (methods (case patch-direction
-                                         :upgrade _upgrade
-                                         :downgrade _downgrade))))
+                              (fn [[_topic _]]
+                                (= _topic topic))
+                              (keys
+                                (methods (case patch-direction
+                                           :upgrade _upgrade
+                                           :downgrade _downgrade))))
              sorted (sort-by
-                     second
-                     (case patch-direction
-                       :upgrade vrs/older?
-                       :downgrade vrs/newer?)
-                     patch-sequence)
+                      second
+                      (case patch-direction
+                        :upgrade vrs/older?
+                        :downgrade vrs/newer?)
+                      patch-sequence)
              valid-sequence (keep
-                             (fn [[_ version :as data]]
-                               (when (case patch-direction
-                                       :upgrade (and
-                                                 (vrs/older-or-equal? version target)
-                                                 (vrs/newer? version current))
-                                       :downgrade (and
-                                                   (vrs/older-or-equal? version current)
-                                                   (vrs/newer? version target)))
-                                 data))
-                             sorted)]
+                              (fn [[_ version :as data]]
+                                (when (case patch-direction
+                                        :upgrade (and
+                                                   (vrs/older-or-equal? version target)
+                                                   (vrs/newer? version current))
+                                        :downgrade (and
+                                                     (vrs/older-or-equal? version current)
+                                                     (vrs/newer? version target)))
+                                  data))
+                              sorted)]
          (doseq [[topic version] valid-sequence]
            (case patch-direction
              :upgrade (_upgrade topic version)
@@ -298,12 +298,17 @@
     (available-versions :app :db :unknown)  ; => {:app \"2.0.0\" :db \"1.5.0\"}"
   ([& topics]
    (reduce-kv
-    (fn [r k f]
-      (assoc r k (f k)))
-    nil
-    (if (empty? topics)
-      (methods version)
-      (select-keys (methods version) topics)))))
+     (fn [r k f]
+       (assoc r k (f k)))
+     nil
+     (if (empty? topics)
+       (methods version)
+       (select-keys (methods version) topics)))))
+
+
+(defn topic-version
+  [topic]
+  (read-version *version-store* topic))
 
 (defn registered-topics
   "Returns a set of all registered topics (components with current-version defined).
@@ -312,7 +317,7 @@
     Set of topic keywords
 
   Example:
-    (registered-topics)  ; => #{:synticity/iam :synticity/iam-audit :synticity/dataset}"
+    (registered-topics)  ; => #{:synthigy/iam :synthigy/iam-audit :synthigy/dataset}"
   []
   (set (keys (methods version))))
 
@@ -335,11 +340,11 @@
     ; Instead of writing custom level-X! functions:
     (defn level-iam! []
       (log/info \"[IAM] Leveling...\")
-      (apply :synticity/iam)
+      (apply :synthigy/iam)
       (log/info \"Done\"))
 
     ; Just use:
-    (level! :synticity/iam)"
+    (level! :synthigy/iam)"
   ([topic]
    (let [;; Handle topics that don't have installed-version defined
          current (try
@@ -354,17 +359,9 @@
      (if (or (vrs/older? target current)
              (vrs/newer? target current))
        (do
-         (println (format "[%s] Leveling component from %s to %s..."
-                          (name topic) current target))
          (apply topic)
-         (println (format "[%s] Component leveled to %s"
-                          (name topic)
-                          (if *version-store*
-                            (read-version *version-store* topic)
-                            target)))
          target)
        (do
-         (println (format "[%s] Already at version %s" (name topic) current))
          nil))))
   ([topic & more-topics]
    (doseq [t (cons topic more-topics)]
@@ -382,17 +379,15 @@
   Example:
     ; Level all components at once
     (level-all!)
-    ; => {:synticity/iam \"1.0.0\" :synticity/iam-audit \"1.0.0\"}"
+    ; => {:synthigy/iam \"1.0.0\" :synthigy/iam-audit \"1.0.0\"}"
   []
-  (println "Leveling all registered components...")
   (let [results (reduce
-                 (fn [acc topic]
-                   (if-let [new-version (level! topic)]
-                     (assoc acc topic new-version)
-                     acc))
-                 {}
-                 (registered-topics))]
-    (println (format "Leveling complete. Updated %d component(s)" (count results)))
+                  (fn [acc topic]
+                    (if-let [new-version (level! topic)]
+                      (assoc acc topic new-version)
+                      acc))
+                  {}
+                  (registered-topics))]
     results))
 
 (comment
@@ -411,5 +406,5 @@
   (vrs/newer-or-equal? "0.0.1" "0")
   (apply ::datasets nil "0.0.1")
   (macroexpand-1
-   `(upgrade ::datasets "0.3.37" (println "Patching 0.3.37")))
+    `(upgrade ::datasets "0.3.37" (println "Patching 0.3.37")))
   (group-by first (keys (methods _upgrade))))
