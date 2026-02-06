@@ -318,11 +318,11 @@ This is a convenience wrapper around `apply` that:
 ;; Instead of writing custom level-X! functions for each component:
 (defn level-iam! []
   (log/info "[IAM] Leveling...")
-  (patch/apply :synticity/iam)
+  (patch/apply :synthigy/iam)
   (log/info "Done"))
 
 ;; Just use the generic level! function:
-(patch/level! :synticity/iam)
+(patch/level! :synthigy/iam)
 ;; [iam] Leveling component from 0.9.0 to 1.0.0...
 ;; [iam] Component leveled to 1.0.0
 ```
@@ -348,7 +348,7 @@ This function discovers all topics that have been registered via `current-versio
 ;; [audit] Leveling component from 0 to 1.0.0...
 ;; [audit] Component leveled to 1.0.0
 ;; Leveling complete. Updated 2 component(s)
-;; => {:synticity/iam "1.0.0" :synticity/iam-audit "1.0.0"}
+;; => {:synthigy/iam "1.0.0" :synthigy/iam-audit "1.0.0"}
 ```
 
 #### `->FileVersionStore`

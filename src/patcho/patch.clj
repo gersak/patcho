@@ -86,6 +86,7 @@
   [store]
   (alter-var-root #'*version-store* (constantly store)))
 
+
 (defmacro with-store
   "Execute body with a specific VersionStore bound to *version-store*.
 

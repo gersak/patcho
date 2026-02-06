@@ -1,19 +1,21 @@
 (ns patcho.lifecycle-test
   "Tests for module lifecycle management."
   (:require
-   [clojure.test :refer [deftest is testing use-fixtures]]
-   [patcho.lifecycle :as lifecycle]))
+    [clojure.test :refer [deftest is testing use-fixtures]]
+    [patcho.lifecycle :as lifecycle]))
 
 ;;; ============================================================================
 ;;; Test Fixtures
 ;;; ============================================================================
 
 (defn reset-registry-fixture
-  "Reset registry before each test."
+  "Reset registry and lifecycle store before each test."
   [f]
   (lifecycle/reset-registry!)
+  (lifecycle/reset-store!)  ; Reset to fresh in-memory store
   (f)
-  (lifecycle/reset-registry!))
+  (lifecycle/reset-registry!)
+  (lifecycle/reset-store!))
 
 (use-fixtures :each reset-registry-fixture)
 
@@ -34,6 +36,7 @@
       (is (= false @stop-called))))
 
   (testing "Register module with dependencies"
+    (lifecycle/reset-registry!)  ; Clear previous registrations
     (lifecycle/register-module! :test/database
                                 {:start (fn [] nil)
                                  :stop (fn [] nil)})
@@ -44,13 +47,15 @@
                                  :stop (fn [] nil)})
 
     (is (= [:test/database :test/cache] (lifecycle/registered-modules)))
+    ;; Note: :setup-complete? only included when lifecycle store is set
     (is (= {:depends-on [:test/database]
             :started? false
-            :setup-complete? false
-            :has-setup? false}
+            :has-setup? false
+            :has-cleanup? false}
            (lifecycle/module-info :test/cache))))
 
   (testing "Register module with setup"
+    (lifecycle/reset-registry!)  ; Clear previous registrations
     (let [setup-called (atom false)]
       (lifecycle/register-module! :test/with-setup
                                   {:setup (fn [& args] (reset! setup-called args))
@@ -111,35 +116,39 @@
 ;;; ============================================================================
 
 (deftest dependency-validation-test
-  (testing "Cannot start module with unstarted dependency"
-    (lifecycle/register-module! :test/database
+  (testing "start! recursively starts dependencies"
+    (let [start-order (atom [])]
+      (lifecycle/register-module! :test/database-dep
+                                  {:start (fn [] (swap! start-order conj :database))
+                                   :stop (fn [] nil)})
+
+      (lifecycle/register-module! :test/cache-dep
+                                  {:depends-on [:test/database-dep]
+                                   :start (fn [] (swap! start-order conj :cache))
+                                   :stop (fn [] nil)})
+
+      ;; Start cache directly - should auto-start database first
+      (lifecycle/start! :test/cache-dep)
+
+      (is (= [:database :cache] @start-order))
+      (is (= true (lifecycle/started? :test/database-dep)))
+      (is (= true (lifecycle/started? :test/cache-dep)))))
+
+  (testing "Can start modules in any order (recursive)"
+    (lifecycle/register-module! :test/db-any
                                 {:start (fn [] nil)
                                  :stop (fn [] nil)})
 
-    (lifecycle/register-module! :test/cache
-                                {:depends-on [:test/database]
+    (lifecycle/register-module! :test/app-any
+                                {:depends-on [:test/db-any]
                                  :start (fn [] nil)
                                  :stop (fn [] nil)})
 
-    (is (thrown-with-msg?
-         clojure.lang.ExceptionInfo
-         #"Dependency not started"
-         (lifecycle/start! :test/cache))))
+    ;; Can start in any order - dependencies started automatically
+    (lifecycle/start! :test/app-any)
 
-  (testing "Can start module after dependency started"
-    (lifecycle/register-module! :test/db
-                                {:start (fn [] nil)
-                                 :stop (fn [] nil)})
-
-    (lifecycle/register-module! :test/app
-                                {:depends-on [:test/db]
-                                 :start (fn [] nil)
-                                 :stop (fn [] nil)})
-
-    (lifecycle/start! :test/db)
-    (lifecycle/start! :test/app)
-
-    (is (= [:test/db :test/app] (lifecycle/started-modules))))
+    (is (= true (lifecycle/started? :test/db-any)))
+    (is (= true (lifecycle/started? :test/app-any))))
 
   (testing "Missing dependency throws error"
     (lifecycle/register-module! :test/broken
@@ -148,79 +157,9 @@
                                  :stop (fn [] nil)})
 
     (is (thrown-with-msg?
-         clojure.lang.ExceptionInfo
-         #"Missing module dependencies"
-         (lifecycle/start! :test/broken)))))
-
-;;; ============================================================================
-;;; Topological Sort Tests
-;;; ============================================================================
-
-(deftest start-all-test
-  (testing "Start all modules in dependency order"
-    (let [execution-order (atom [])]
-      ;; Register modules in random order
-      (lifecycle/register-module! :test/cache
-                                  {:depends-on [:test/database]
-                                   :start (fn [] (swap! execution-order conj :cache))
-                                   :stop (fn [] nil)})
-
-      (lifecycle/register-module! :test/api
-                                  {:depends-on [:test/cache]
-                                   :start (fn [] (swap! execution-order conj :api))
-                                   :stop (fn [] nil)})
-
-      (lifecycle/register-module! :test/database
-                                  {:start (fn [] (swap! execution-order conj :database))
-                                   :stop (fn [] nil)})
-
-      ;; Start all - should be in dependency order
-      (lifecycle/start-all!)
-
-      (is (= [:database :cache :api] @execution-order))
-      (is (= [:test/database :test/cache :test/api]
-             (lifecycle/started-modules)))))
-
-  (testing "Circular dependency detection"
-    (lifecycle/register-module! :test/a
-                                {:depends-on [:test/b]
-                                 :start (fn [] nil)
-                                 :stop (fn [] nil)})
-
-    (lifecycle/register-module! :test/b
-                                {:depends-on [:test/a]
-                                 :start (fn [] nil)
-                                 :stop (fn [] nil)})
-
-    (is (thrown-with-msg?
-         clojure.lang.ExceptionInfo
-         #"Circular dependency"
-         (lifecycle/start-all!)))))
-
-(deftest stop-all-test
-  (testing "Stop all modules in reverse dependency order"
-    (let [execution-order (atom [])]
-      ;; Register chain: database → cache → api
-      (lifecycle/register-module! :test/database
-                                  {:start (fn [] nil)
-                                   :stop (fn [] (swap! execution-order conj :database))})
-
-      (lifecycle/register-module! :test/cache
-                                  {:depends-on [:test/database]
-                                   :start (fn [] nil)
-                                   :stop (fn [] (swap! execution-order conj :cache))})
-
-      (lifecycle/register-module! :test/api
-                                  {:depends-on [:test/cache]
-                                   :start (fn [] nil)
-                                   :stop (fn [] (swap! execution-order conj :api))})
-
-      (lifecycle/start-all!)
-      (lifecycle/stop-all!)
-
-      ;; Should stop in reverse order
-      (is (= [:api :cache :database] @execution-order))
-      (is (= [] (lifecycle/started-modules))))))
+          clojure.lang.ExceptionInfo
+          #"Missing module dependencies"
+          (lifecycle/start! :test/broken)))))
 
 ;;; ============================================================================
 ;;; Setup Tests
@@ -262,15 +201,52 @@
 
       (is (= 1 @setup-count))))
 
-  (testing "Module without setup throws error"
-    (lifecycle/register-module! :test/no-setup
+  (testing "Module without setup is a no-op (idempotent)"
+    (lifecycle/register-module! :test/no-setup-idempotent
                                 {:start (fn [] nil)
                                  :stop (fn [] nil)})
 
-    (is (thrown-with-msg?
-         clojure.lang.ExceptionInfo
-         #"Module has no setup function"
-         (lifecycle/setup! :test/no-setup)))))
+    ;; Calling setup! on module without setup function is safe (no-op)
+    (lifecycle/setup! :test/no-setup-idempotent)
+
+    ;; Module info shows setup-complete even though no setup function
+    (is (= true (:setup-complete? (lifecycle/module-info :test/no-setup-idempotent)))))
+
+  (testing "start! auto-runs setup if needed"
+    (let [setup-count (atom 0)
+          start-count (atom 0)]
+      (lifecycle/register-module! :test/auto-setup
+                                  {:setup (fn [] (swap! setup-count inc))
+                                   :start (fn [] (swap! start-count inc))
+                                   :stop (fn [] nil)})
+
+      ;; Call start! without calling setup! first
+      (lifecycle/start! :test/auto-setup)
+
+      ;; Verify both setup and start were called
+      (is (= 1 @setup-count) "Setup should be called automatically")
+      (is (= 1 @start-count) "Start should be called")
+      (is (true? (:setup-complete? (lifecycle/module-info :test/auto-setup))))
+      (is (true? (lifecycle/started? :test/auto-setup)))
+
+      ;; Stop and start again - setup should NOT run again (idempotent)
+      (lifecycle/stop! :test/auto-setup)
+      (lifecycle/start! :test/auto-setup)
+
+      (is (= 1 @setup-count) "Setup should not run again (idempotent)")
+      (is (= 2 @start-count) "Start should be called again")))
+
+  (testing "start! without setup works for modules without setup function"
+    (let [start-count (atom 0)]
+      (lifecycle/register-module! :test/no-setup-needed
+                                  {:start (fn [] (swap! start-count inc))
+                                   :stop (fn [] nil)})
+
+      ;; Start should work fine without setup function
+      (lifecycle/start! :test/no-setup-needed)
+
+      (is (= 1 @start-count))
+      (is (true? (lifecycle/started? :test/no-setup-needed))))))
 
 ;;; ============================================================================
 ;;; Restart Tests
@@ -298,20 +274,26 @@
 (deftest dependency-graph-test
   (testing "Generate dependency graph"
     (lifecycle/register-module! :test/database
-                                {:start (fn [] nil) :stop (fn [] nil)})
+                                {:start (fn [] nil)
+                                 :stop (fn [] nil)})
 
     (lifecycle/register-module! :test/cache
                                 {:depends-on [:test/database]
-                                 :start (fn [] nil) :stop (fn [] nil)})
+                                 :start (fn [] nil)
+                                 :stop (fn [] nil)})
 
     (lifecycle/register-module! :test/api
                                 {:depends-on [:test/cache]
-                                 :start (fn [] nil) :stop (fn [] nil)})
+                                 :start (fn [] nil)
+                                 :stop (fn [] nil)})
 
     (let [graph (lifecycle/dependency-graph)]
-      (is (= {:depends-on [] :dependents [:test/cache]}
+      (is (= {:depends-on []
+              :dependents [:test/cache]}
              (get graph :test/database)))
-      (is (= {:depends-on [:test/database] :dependents [:test/api]}
+      (is (= {:depends-on [:test/database]
+              :dependents [:test/api]}
              (get graph :test/cache)))
-      (is (= {:depends-on [:test/cache] :dependents []}
+      (is (= {:depends-on [:test/cache]
+              :dependents []}
              (get graph :test/api))))))

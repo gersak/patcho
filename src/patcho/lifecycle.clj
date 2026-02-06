@@ -46,15 +46,14 @@
       ;; Set default store once (typically in main or init)
       (lifecycle/set-store! (lifecycle/->FileLifecycleStore \".lifecycle\"))
 
-      ;; One-time setup (RECURSIVE - handles all dependencies)
-      (lifecycle/setup! :my/api)
-      ;; → Starts :my/database, setups :my/database
-      ;; → Starts :my/cache, setups :my/cache
-      ;; → Setups :my/api
-
-      ;; Start application (RECURSIVE)
+      ;; Simple approach: Just start! (auto-runs setup if needed)
       (lifecycle/start! :my/api)
-      ;; → Starts: :my/database → :my/cache → :my/api
+      ;; → Setups (if needed) and starts: :my/database → :my/cache → :my/api
+      ;; Setup is idempotent - only runs once, tracked via lifecycle store
+
+      ;; OR explicit control: Run setup separately (optional)
+      (lifecycle/setup! :my/api)  ; One-time: setup all dependencies
+      (lifecycle/start! :my/api)  ; Runtime: start all dependencies
 
       ;; Visualize dependencies
       (lifecycle/print-dependency-tree :my/api)
@@ -79,8 +78,10 @@
 
   They work together:
   1. Apply patches to reach target version (patch/level!)
-  2. Run one-time setup if needed (lifecycle/setup!)
-  3. Start runtime services (lifecycle/start!)
+  2. Start runtime services (lifecycle/start!) - auto-runs setup if needed
+
+  Note: start! automatically runs setup for modules that have a setup function,
+  making the system easy to use while maintaining explicit control when needed.
 
   ## Design Decisions
 
@@ -88,6 +89,7 @@
   - Keyword topics: Same style as Patcho (:my/module)
   - Explicit dependencies: Clear, validated at runtime
   - RECURSIVE operations: start/setup/cleanup handle deps automatically
+  - Auto-setup: start! runs setup if needed (idempotent via lifecycle store)
   - Reference counting: cleanup only removes if not claimed by others
   - State tracking: Prevents double-start bugs
   - Functions not protocols: Simple, direct
@@ -164,31 +166,98 @@
       (write-edn-file file-path updated))))
 
 ;;; ============================================================================
+;;; Atom-based LifecycleStore (in-memory)
+;;; ============================================================================
+
+(defrecord AtomLifecycleStore [state-atom]
+  LifecycleStore
+  (read-lifecycle-state [_ topic]
+    (get @state-atom topic {}))
+  (write-lifecycle-state [_ topic state]
+    (swap! state-atom assoc topic state)))
+
+(defn migrate-store!
+  "Migrate lifecycle state from one store to another.
+
+  Useful for bootstrapping: start with AtomLifecycleStore, setup database,
+  then migrate state to database-backed store.
+
+  Args:
+    from-store - Source LifecycleStore to read from
+    to-store   - Destination LifecycleStore to write to
+    topics     - Collection of topic keywords to migrate (or nil for all registered)
+
+  Returns:
+    Set of migrated topics
+
+  Example:
+    ;; Bootstrap with in-memory store
+    (def bootstrap-store (->AtomLifecycleStore (atom {})))
+    (set-store! bootstrap-store)
+    (setup! :synthigy/database)
+
+    ;; Migrate to database store
+    (migrate-store! bootstrap-store db/*db* nil)
+    (set-store! db/*db*)"
+  [from-store to-store topics]
+  (let [topics (or topics (keys @modules))]
+    (doseq [topic topics]
+      (let [state (read-lifecycle-state from-store topic)]
+        (when (seq state)
+          (write-lifecycle-state to-store topic state))))
+    (set topics)))
+
+;;; ============================================================================
 ;;; Store Management
 ;;; ============================================================================
 
 (def ^:dynamic *lifecycle-store*
   "Dynamic var for the lifecycle store.
 
-  Defaults to FileLifecycleStore with `.lifecycle` file.
-  Set globally via set-store!, or temporarily via with-store macro."
-  (->FileLifecycleStore ".lifecycle"))
+  Defaults to AtomLifecycleStore (in-memory). State is lost on restart unless
+  you explicitly set a persistent store (FileLifecycleStore, database, etc.).
+
+  Set globally via set-store!, or temporarily via with-store macro.
+  State is automatically migrated when switching stores."
+  (->AtomLifecycleStore (atom {})))
 
 (defn set-store!
   "Set the default lifecycle store globally.
 
-  This sets the root binding of *lifecycle-store* for all lifecycle operations.
+  Automatically migrates state from the previous store to the new one.
+  This makes store transitions seamless (e.g., from bootstrap AtomLifecycleStore
+  to database-backed store).
 
    Arguments:
-     store - Implementation of LifecycleStore protocol
+     store - Implementation of LifecycleStore protocol (or nil to clear)
 
    Example:
-     (set-store! (->FileLifecycleStore \".lifecycle\"))
+     ;; Bootstrap with in-memory store
+     (set-store! (->AtomLifecycleStore (atom {})))
+     (setup! :my/database)
 
-     (setup! :my/app)     ; Uses the default store
-     (cleanup! :my/db)    ; Uses the default store"
+     ;; Switch to DB - state auto-migrates
+     (set-store! db/*db*)
+
+     (setup! :my/app)     ; Uses database store"
   [store]
-  (alter-var-root #'*lifecycle-store* (constantly store)))
+  (alter-var-root #'*lifecycle-store*
+                  (fn [old-store]
+                    (when (and old-store (not= old-store store))
+                      (migrate-store! old-store store nil))
+                    store)))
+
+(defn reset-store!
+  "Reset lifecycle store to a fresh in-memory AtomLifecycleStore.
+
+  Use this when cleaning up the database to clear all persisted state
+  and start fresh. Does NOT migrate state (old state is discarded).
+
+  Example:
+    ;; In database cleanup
+    (reset-store!)  ; Fresh atom store, no state"
+  []
+  (alter-var-root #'*lifecycle-store* (constantly (->AtomLifecycleStore (atom {})))))
 
 (defmacro with-store
   "Execute body with a specific LifecycleStore bound to *lifecycle-store*.
@@ -292,6 +361,11 @@
         base-info))))
 
 
+(defn setup-complete?
+  [topic]
+  (:setup-complete? (read-lifecycle-state *lifecycle-store* topic)))
+
+
 (defn started?
   "Returns true if module is currently started."
   [topic]
@@ -334,6 +408,9 @@
 ;;; Lifecycle Operations
 ;;; ============================================================================
 
+;; Forward declarations (setup! is defined later but called from start!)
+(declare setup!)
+
 (defn start!
   "Start a module RECURSIVELY (starts all dependencies first).
 
@@ -341,38 +418,46 @@
   Dependencies are started in correct order automatically.
   Records errors in module-errors atom if startup fails.
 
+  If module has a setup function and setup hasn't been completed yet,
+  automatically runs setup first (idempotent via lifecycle store).
+
   Parameters:
     topic - Module keyword
 
   Example:
     (start! :my/api)
-    ;; → Starts :my/database → :my/cache → :my/api"
+    ;; → Setups (if needed) and starts: :my/database → :my/cache → :my/api"
   ([topic]
    (validate-module-exists topic)
    (let [module (get @modules topic)
-         {:keys [depends-on start started?]} module]
-     (try
-       ;; Validate dependencies exist
-       (validate-dependencies topic depends-on)
+         {:keys [depends-on start started? setup]} module]
+     ;; Early exit if already started - no need to recurse
+     (when-not started?
+       (try
+         ;; Validate dependencies exist
+         (validate-dependencies topic depends-on)
 
-       ;; RECURSIVELY start dependencies first
-       (doseq [dep depends-on]
-         (start! dep))
+         ;; Auto-run setup if module has one (idempotent via lifecycle store)
+         (when (and (ifn? setup) *lifecycle-store*)
+           (setup! topic))
 
-       ;; Start this module (if not already started)
-       (when-not started?
+         ;; RECURSIVELY start dependencies first
+         (doseq [dep depends-on]
+           (start! dep))
+
+         ;; Start this module
          ;; Clear any previous error for this module
          (swap! module-errors dissoc topic)
          (start)
-         (swap! modules assoc-in [topic :started?] true))
+         (swap! modules assoc-in [topic :started?] true)
 
-       (catch Exception e
-         ;; Record error with timestamp
-         (swap! module-errors assoc topic
-                {:error e
-                 :timestamp (java.util.Date.)})
-         ;; Re-throw to maintain existing behavior
-         (throw e)))))
+         (catch Exception e
+           ;; Record error with timestamp
+           (swap! module-errors assoc topic
+                  {:error e
+                   :timestamp (java.util.Date.)})
+           ;; Re-throw to maintain existing behavior
+           (throw e))))))
   ([topic & more-topics]
    (doseq [t (cons topic more-topics)]
      (start! t))))
@@ -390,12 +475,11 @@
   [topic]
   (validate-module-exists topic)
   (let [module (get @modules topic)
-        {:keys [stop]} module
-        stop-atom (:started? module)]
-
-    (when @stop-atom
+        {:keys [stop started?]} module]
+    ;; Only stop if actually running
+    (when started?
       (stop)
-      (reset! stop-atom false))))
+      (swap! modules assoc-in [topic :started?] false))))
 
 (defn- setup-single!
   "Run one-time setup for a single module RECURSIVELY.
@@ -407,26 +491,27 @@
                     {:module topic})))
   (validate-module-exists topic)
   (let [module (get @modules topic)
-        {:keys [depends-on setup]} module
-        state (read-lifecycle-state *lifecycle-store* topic)]
+        {:keys [depends-on setup]} module]
 
-    ;; Validate dependencies exist
-    (validate-dependencies topic depends-on)
+    ;; Early exit if already setup - no need to recurse
+    (when-not (setup-complete? topic)
+      ;; Validate dependencies exist
+      (validate-dependencies topic depends-on)
 
-    ;; Make sure that everythign is setup
-    (doseq [dep depends-on]
-      (setup-single! dep))
+      ;; Make sure that everything is setup
+      (doseq [dep depends-on]
+        (setup-single! dep))
 
-    ;; RECURSIVELY start dependencies first (setup needs them running!)
-    (doseq [dep depends-on]
-      (start! dep))
+      ;; RECURSIVELY start dependencies first (setup needs them running!)
+      (doseq [dep depends-on]
+        (start! dep))
 
-    ;; Run setup (if not already complete)
-    (when-not (:setup-complete? state)
-      (when (ifn? setup) (setup))
+      ;; Run setup
+      (when (and (ifn? setup) (not (setup-complete? topic)))
+        (setup))
       ;; Mark setup complete and reset cleanup-complete so cleanup can run again
       (write-lifecycle-state *lifecycle-store* topic
-                             (assoc state
+                             (assoc (read-lifecycle-state *lifecycle-store* topic)
                                :setup-complete? true
                                :cleanup-complete? false)))))
 
@@ -487,6 +572,9 @@
   (doseq [dependant (get-dependants topic)]
     (cleanup! dependant))
 
+  ;; Stop this module before cleanup (must stop before destroying resources)
+  (stop! topic)
+
   ;; Then cleanup this module (if it has a cleanup function)
   ;; Always run cleanup - it should be idempotent (safe to run multiple times)
   (let [module (get @modules topic)
@@ -515,100 +603,6 @@
   [topic]
   (stop! topic)
   (start! topic))
-
-;;; ============================================================================
-;;; Batch Operations
-;;; ============================================================================
-
-(defn- topological-sort
-  "Returns modules in dependency order (dependencies first).
-
-  Uses Kahn's algorithm for topological sorting.
-  Throws ex-info if circular dependencies detected."
-  [module-map]
-  (loop [result []
-         remaining module-map
-         in-degree (into {} (map (fn [[k v]]
-                                   [k (count (:depends-on v))])
-                                 module-map))]
-    (if (empty? remaining)
-      result
-      (let [ready (filter (fn [[k _]] (zero? (in-degree k))) remaining)]
-        (when (empty? ready)
-          (throw (ex-info "Circular dependency detected"
-                          {:remaining-modules (keys remaining)})))
-        (let [next-topic (ffirst ready)]
-          (recur
-            (conj result next-topic)
-            (dissoc remaining next-topic)
-            (reduce (fn [deg dep]
-                      (update deg dep dec))
-                    (dissoc in-degree next-topic)
-                    (mapcat (fn [[k v]]
-                              (when (some #{next-topic} (:depends-on v))
-                                [k]))
-                            remaining))))))))
-
-(defn start-all!
-  "Start all registered modules in dependency order.
-
-  Automatically calculates correct startup order using topological sort.
-  Skips modules that are already started.
-
-  Returns:
-    Vector of started module topics in order
-
-  Example:
-    (start-all!)
-    ;; => [:my/database :my/cache :my/api]"
-  []
-  (let [sorted (topological-sort @modules)]
-    (doseq [topic sorted]
-      (start! topic))
-    sorted))
-
-(defn stop-all!
-  "Stop all started modules in reverse dependency order.
-
-  Stops dependents before their dependencies.
-  Skips modules that are not started.
-
-  Returns:
-    Vector of stopped module topics in order
-
-  Example:
-    (stop-all!)
-    ;; => [:my/api :my/cache :my/database]"
-  []
-  (let [sorted (reverse (topological-sort @modules))
-        to-stop (filter started? sorted)]
-    (doseq [topic to-stop]
-      (stop! topic))
-    (vec to-stop)))
-
-(defn setup-all!
-  "Run setup for all registered modules in dependency order.
-
-  Each module's dependencies are started before its setup runs.
-  Skips modules that already have setup complete.
-
-  Uses *lifecycle-store* - set it via set-store! or with-store macro.
-
-  Returns:
-    Vector of setup module topics in order
-
-  Example:
-    (set-store! (->FileLifecycleStore \".lifecycle\"))
-    (setup-all!)"
-  []
-  (when-not *lifecycle-store*
-    (throw (ex-info "No lifecycle store configured. Use set-store!"
-                    {})))
-  (let [sorted (topological-sort @modules)]
-    (doseq [topic sorted]
-      (when (:has-setup? (module-info topic))
-        (setup! topic)))
-    sorted))
 
 ;;; ============================================================================
 ;;; Dependency Visualization
@@ -1011,6 +1005,10 @@
                         (str/join ", " missing)
                         " (not registered)")))))))
 
+
+(comment
+  (print-system-report))
+
 (defn clear-errors!
   "Clear all recorded module errors.
 
@@ -1032,6 +1030,6 @@
   WARNING: This is primarily for testing. Using in production
   may leave modules in inconsistent state.
 
-  Use stop-all! first if modules are running."
+  Stop your running modules first before calling this."
   []
   (reset! modules {}))
