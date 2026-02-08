@@ -16,13 +16,19 @@ Patcho provides a declarative way to define version upgrades and downgrades for 
 - **Topic-based organization**: Group related patches by topic/module
 - **Simple declarative API**: Use macros to define versions and migrations
 - **Version comparison**: Built on version-clj for reliable semantic versioning
+- **Lifecycle management**: Start/stop modules with automatic dependency resolution
+
+## Documentation
+
+- [Lifecycle Management](docs/lifecycle.md) - Runtime module management with dependencies
+- [Extending Stores](docs/stores.md) - Custom persistence for databases, Redis, etc.
 
 ## Installation
 
 Add to your `deps.edn`:
 
 ```clojure
-{:deps {patcho/patcho {:local/root "path/to/patcho"}}}
+{:deps {dev.gersak/patcho {:mvn/version "0.3.0"}}}
 ```
 
 ## Usage
@@ -362,6 +368,41 @@ Creates a file-based VersionStore that persists versions to an EDN file.
 (->AtomVersionStore state-atom)
 ```
 Creates an atom-based VersionStore for in-memory version tracking (useful for testing).
+
+## Lifecycle Management
+
+Patcho includes a complementary lifecycle system for runtime module management:
+
+```clojure
+(require '[patcho.lifecycle :as lifecycle])
+
+;; Register modules with dependencies
+(lifecycle/register-module! :myapp/database
+  {:start (fn [] (connect!))
+   :stop (fn [] (disconnect!))})
+
+(lifecycle/register-module! :myapp/cache
+  {:depends-on [:myapp/database]
+   :setup (fn [] (create-tables!))    ; One-time setup
+   :cleanup (fn [] (drop-tables!))    ; One-time cleanup
+   :start (fn [] (start-cache!))      ; Runtime start
+   :stop (fn [] (stop-cache!))})      ; Runtime stop
+
+;; Start with automatic dependency resolution
+(lifecycle/start! :myapp/cache)
+;; → Starts :myapp/database first, then :myapp/cache
+
+;; Visualize dependencies
+(lifecycle/print-dependency-tree :myapp/cache)
+;; :myapp/cache
+;; └── :myapp/database
+```
+
+**Key differences from patcho.patch:**
+- `patcho.patch`: Version migrations (data/schema state transitions)
+- `patcho.lifecycle`: Runtime management (start/stop with dependencies)
+
+See [Lifecycle Management](docs/lifecycle.md) for the full guide.
 
 ## Design Philosophy
 
