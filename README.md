@@ -31,7 +31,8 @@ Services and HTTP clients need to know what version they're talking to. The `ava
 [Expose versions to clients →](#version-awareness)
 
 
->[!IMPORTANT] **⚠️ You must configure persistent storage.**
+>[!IMPORTANT]
+> **⚠️ You must configure persistent storage.**
 >
 > Both patches and lifecycle default to in-memory stores. Without persistence, every boot looks like the first boot—patches rerun, setup repeats. Before your application does anything meaningful, call:
 >
