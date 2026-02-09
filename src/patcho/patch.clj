@@ -368,29 +368,6 @@
    (doseq [t (cons topic more-topics)]
      (level! t))))
 
-(defn level-all!
-  "Level all registered components in registration order.
-
-  This function discovers all topics that have been registered via current-version
-  and levels each one by calling level!
-
-  Returns:
-    Map of {topic version} for components that were actually updated
-
-  Example:
-    ; Level all components at once
-    (level-all!)
-    ; => {:synthigy/iam \"1.0.0\" :synthigy/iam-audit \"1.0.0\"}"
-  []
-  (let [results (reduce
-                  (fn [acc topic]
-                    (if-let [new-version (level! topic)]
-                      (assoc acc topic new-version)
-                      acc))
-                  {}
-                  (registered-topics))]
-    results))
-
 (comment
   (vrs/newer? "0" "0.0.0")
   (vrs/older? "0" "0.0.0")

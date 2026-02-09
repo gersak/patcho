@@ -1,430 +1,339 @@
 # Patcho
 
-A simple, elegant Clojure library for managing version migrations and patches.
-
+A Clojure library for version migrations and module lifecycle management.
 
 [![Clojars Project](https://img.shields.io/clojars/v/dev.gersak/patcho.svg)](https://clojars.org/dev.gersak/patcho)
 
-## Overview
+## Why Patcho?
 
-Patcho provides a declarative way to define version upgrades and downgrades for your application or modules. It automatically determines which patches need to be applied to migrate from one version to another, executing them in the correct order.
+Patcho addresses two concerns that existing solutions handle incompletely:
 
-## Features
+### Version Migrations
 
-- **Bidirectional migrations**: Define both upgrade and downgrade paths
-- **Automatic patch sequencing**: Patches are applied in the correct order based on version comparison
-- **Topic-based organization**: Group related patches by topic/module
-- **Simple declarative API**: Use macros to define versions and migrations
-- **Version comparison**: Built on version-clj for reliable semantic versioning
-- **Lifecycle management**: Start/stop modules with automatic dependency resolution
+Database migration tools abound, but what about migrating your *application* state? When your system evolves—new triggers, converted column types, backfilled data, recalculated caches—you need reliable version transitions.
 
-## Documentation
+Patcho patches are **stateless transitions**. They don't receive arguments. They reach into whatever context they need: database connections, deployed schemas, configuration. This isn't a limitation—it's the point.
 
-- [Lifecycle Management](docs/lifecycle.md) - Runtime module management with dependencies
-- [Extending Stores](docs/stores.md) - Custom persistence for databases, Redis, etc.
+```clojure
+;; Patches access context themselves
+(patch/upgrade :myapp/audit "1.0.1"
+  (let [db *db*                           ; Dynamic var
+        model (deployed-model)            ; Function call
+        entities (get-entities model)]    ; Whatever you need
+    (doseq [entity entities]
+      (add-audit-columns! db entity))))
+```
+
+The patch defines *what* happens at version `1.0.1`. How to get the database connection, the model, the entities—that's your concern, not Patcho's. This forces clean separation and makes patches self-contained.
+
+### Module Lifecycle
+
+[Component](https://github.com/stuartsierra/component) and [Integrant](https://github.com/weavejester/integrant) are excellent libraries for managing runtime dependencies. But they focus on **start/stop** cycles—what happens every time your application boots.
+
+What about **one-time operations**?
+
+- Creating database tables
+- Installing triggers
+- Initializing schema
+- Setting up external resources
+
+These aren't "start" operations—you don't want them running every boot. And stopping your app doesn't mean dropping tables.
+
+Patcho separates these concerns:
+
+| | Patches | Lifecycle |
+|---|---|---|
+| **Purpose** | Version transitions | Runtime management |
+| **When** | Once per version | Every boot |
+| **Examples** | Create tables, add triggers, migrate data | Open connections, spawn threads |
+| **Persistence** | Version tracked in store | Started state in-memory |
+
+```clojure
+;; Patches define what happens at each version
+(patch/upgrade :myapp/cache "1.0.0" (create-cache-tables!))
+(patch/upgrade :myapp/cache "1.1.0" (add-cache-indexes!))
+
+;; Lifecycle manages runtime - level! applies pending patches
+(lifecycle/register-module! :myapp/cache
+  {:depends-on [:myapp/database]
+   :start (fn []
+            (patch/level! :myapp/cache)     ; Bring to current version
+            (connect-to-cache!))
+   :stop  (fn [] (disconnect!))})
+```
 
 ## Installation
-
-Add to your `deps.edn`:
 
 ```clojure
 {:deps {dev.gersak/patcho {:mvn/version "0.3.0"}}}
 ```
 
-## Usage
+---
 
-### Basic Example
+## Version Patching
+
+### The Basics
 
 ```clojure
-(require '[patcho.patch :as patch])
+(ns myapp.database.patch
+  (:require
+    [patcho.patch :as patch]
+    [myapp.db :refer [*db*]]))
 
-;; Define the current version of your application
-(patch/current-version ::my-app "2.0.0")
+;; What version should the system be at?
+(patch/current-version :myapp/database "2.0.0")
 
-;; Define upgrade patches
-(patch/upgrade ::my-app "1.0.0"
-  (println "Setting up initial database schema"))
+;; What version is actually installed?
+(patch/installed-version :myapp/database
+  (patch/read-version *db* :myapp/database))
 
-(patch/upgrade ::my-app "1.5.0"
-  (println "Adding user preferences table"))
+;; Define what happens at each version boundary
+(patch/upgrade :myapp/database "1.0.0"
+  (println "Creating initial schema")
+  (create-tables! *db*))
 
-(patch/upgrade ::my-app "2.0.0"
-  (println "Migrating to new authentication system"))
+(patch/upgrade :myapp/database "1.5.0"
+  (println "Adding indexes")
+  (add-indexes! *db*))
 
-;; Define downgrade patches (optional)
-(patch/downgrade ::my-app "1.5.0"
-  (println "Removing authentication system")
-  (println "Restoring legacy auth"))
+(patch/upgrade :myapp/database "2.0.0"
+  (println "Converting integer columns to bigint")
+  (convert-int-to-bigint! *db*))
 
-;; Apply patches to upgrade from version 1.0.0 to current
-(patch/apply ::my-app "1.0.0")
-;; Will execute: 1.5.0 and 2.0.0 upgrades
-
-;; Apply patches to upgrade from nothing (nil) to current
-(patch/apply ::my-app nil)
-;; Will execute: 1.0.0, 1.5.0, and 2.0.0 upgrades
+;; Downgrade patches (optional - for rollback)
+(patch/downgrade :myapp/database "2.0.0"
+  (println "Reverting bigint conversion")
+  (convert-bigint-to-int! *db*))
 ```
 
-### Installed Version Tracking
-
-Patcho can track what version is currently installed separately from the target version:
+### Applying Patches
 
 ```clojure
-;; Define target version (what the system should be)
-(patch/current-version ::my-app "2.0.0")
+;; Bring system to current version (from installed version)
+(patch/level! :myapp/database)
+;; If installed is 1.0.0, runs: 1.5.0, 2.0.0
 
-;; Define installed version (what's actually deployed)
-(patch/installed-version ::my-app "1.5.0")
+;; Or explicit version range
+(patch/apply :myapp/database "1.0.0" "2.0.0")
+;; Runs: 1.5.0, 2.0.0
 
-;; Automatically migrate from installed to current version
-(patch/apply ::my-app)
-;; Migrates from 1.5.0 to 2.0.0
-
-;; Check both versions
-(patch/version ::my-app)          ;; => "2.0.0" (target)
-(patch/deployed-version ::my-app) ;; => "1.5.0" (installed)
+;; Downgrade
+(patch/apply :myapp/database "2.0.0" "1.5.0")
+;; Runs: 2.0.0 downgrade
 ```
 
-### Automatic Version Persistence
+### Version Persistence
 
-Patcho provides a `VersionStore` protocol for automatically persisting version state across application restarts. After patches are applied successfully, the new version is automatically written to the store.
-
-#### Using a Default Store for All Topics
-
-The simplest approach - use one store for everything:
+Patcho **must** track what version is installed. Without this, it can't know which patches to apply.
 
 ```clojure
-(require '[patcho.patch :as patch])
+;; Set a persistent store
+(patch/set-store! (patch/->FileVersionStore "versions.edn"))
 
-;; Create a file-based version store
-(def store (patch/->FileVersionStore "versions.edn"))
+;; Or use your database (implement VersionStore protocol)
+(patch/set-store! *db*)
 
-;; Set as default for ALL topics
-(patch/set-store! store)
-
-;; Define multiple topics - all will use the same store automatically
-(patch/current-version ::my-app "2.0.0")
-(patch/current-version ::my-db "3.0.0")
-(patch/current-version ::my-api "1.5.0")
-
-(patch/installed-version ::my-app (patch/read-version store ::my-app))
-(patch/installed-version ::my-db (patch/read-version store ::my-db))
-(patch/installed-version ::my-api (patch/read-version store ::my-api))
-
-;; Define patches for each topic
-(patch/upgrade ::my-app "2.0.0" (println "App upgraded"))
-(patch/upgrade ::my-db "3.0.0" (println "DB upgraded"))
-(patch/upgrade ::my-api "1.5.0" (println "API upgraded"))
-
-;; Apply all - they all write to the same versions.edn file
-(patch/apply ::my-app)
-(patch/apply ::my-db)
-(patch/apply ::my-api)
+;; After patches run, the new version is automatically persisted
+(patch/level! :myapp/database)
+;; → Runs patches
+;; → Writes new version to store
 ```
 
-#### Using Per-Topic Stores
+Built-in stores:
+- `FileVersionStore` - EDN file
+- `AtomVersionStore` - In-memory (testing only)
 
-For more control, register different stores for different topics:
+For database-backed stores, see [Extending Stores](docs/stores.md).
+
+### Real-World Example
+
+From a production system—patches that fix column types and add immutability triggers:
 
 ```clojure
-(require '[patcho.patch :as patch])
+(ns myapp.dataset.patch
+  (:require
+    [patcho.patch :as patch]
+    [myapp.db :refer [*db*]]
+    [myapp.dataset :as dataset]))
 
-;; Different stores for different topics
-(def app-store (patch/->FileVersionStore "app-versions.edn"))
-(def db-store (patch/->FileVersionStore "db-versions.edn"))
+(patch/current-version :myapp/dataset "1.0.1")
+(patch/installed-version :myapp/dataset
+  (patch/read-version *db* :myapp/dataset))
 
-;; Register per topic
-(patch/set-store! ::my-app app-store)
-(patch/set-store! ::my-db db-store)
+;; Patch reaches into context: *db*, dataset/deployed-model, etc.
+(patch/upgrade :myapp/dataset "0.5.0"
+  (when (postgres? *db*)
+    (log/info "Fixing integer types")
+    (doseq [entity (get-entities (dataset/deployed-model))]
+      (convert-int-columns! *db* entity))
 
-;; Define versions
-(patch/current-version ::my-app "2.0.0")
-(patch/installed-version ::my-app (patch/read-version app-store ::my-app))
+    (log/info "Removing NOT NULL constraints")
+    (doseq [entity (get-entities (dataset/deployed-model))]
+      (drop-mandatory-constraints! *db* entity))))
 
-;; Apply patches - each writes to its own file
-(patch/apply ::my-app)  ; Writes to app-versions.edn
+(patch/upgrade :myapp/dataset "1.0.0"
+  (log/info "Dataset initialized at v1.0.0"))
+
+(patch/upgrade :myapp/dataset "1.0.1"
+  (when (postgres? *db*)
+    (log/info "Installing ID immutability triggers")
+    (doseq [table (get-entity-tables)]
+      (create-trigger! *db* table))))
+
+;; Downgrade undoes the trigger installation
+(patch/downgrade :myapp/dataset "1.0.1"
+  (when (postgres? *db*)
+    (log/info "Removing ID immutability triggers")
+    (doseq [table (get-entity-tables)]
+      (drop-trigger! *db* table))))
 ```
 
-#### Using In-Memory Storage (for testing)
+Key observations:
+- Patches access `*db*` directly—no arguments passed
+- Conditional logic (`when (postgres? *db*)`) for database-specific patches
+- Each patch is self-contained and idempotent
+- Version determines *when*, implementation determines *how*
+
+### Exposing Versions to Clients
+
+Frontend apps and API clients often need to know what version they're talking to. Patcho makes this trivial:
 
 ```clojure
-;; Create an atom-based store (not persisted)
-(def test-store (patch/->AtomVersionStore (atom {})))
-
-(patch/set-store! ::test-app test-store)
-(patch/current-version ::test-app "1.0.0")
-(patch/installed-version ::test-app (patch/read-version test-store ::test-app))
-
-(patch/apply ::test-app)
-;; Version is stored in the atom but not persisted to disk
-```
-
-#### Scoped Stores
-
-Use `with-store` to temporarily override the registered store:
-
-```clojure
-(def global-store (patch/->FileVersionStore "versions.edn"))
-(def test-store (patch/->AtomVersionStore (atom {})))
-
-(patch/set-store! ::my-app global-store)
-
-;; This will use test-store instead of global-store
-(patch/with-store test-store
-  (patch/apply ::my-app))
-```
-
-#### Custom Storage Implementations
-
-Implement the `VersionStore` protocol for custom storage backends:
-
-```clojure
-(require '[patcho.patch :as patch])
-
-(deftype DatabaseVersionStore [db-conn]
-  patch/VersionStore
-  (read-version [_ topic]
-    (or (query-version-from-db db-conn topic) "0"))
-  (write-version [_ topic version]
-    (save-version-to-db db-conn topic version)))
-
-(def db-store (->DatabaseVersionStore my-db-connection))
-(patch/set-store! ::my-app db-store)
-```
-
-### Multiple Topics
-
-You can manage different components independently:
-
-```clojure
-;; Database migrations
-(patch/current-version ::database "3.1.0")
-(patch/upgrade ::database "3.0.0" 
-  (migrate-schema-v3))
-(patch/upgrade ::database "3.1.0" 
-  (add-indexes))
-
-;; API versions
-(patch/current-version ::api "2.0.0")
-(patch/upgrade ::api "2.0.0" 
-  (update-endpoints))
-
-;; Apply patches for specific topics
-(patch/apply ::database "2.0.0")
-(patch/apply ::api "1.0.0")
-
-;; Check available versions
+;; Get all module versions
 (patch/available-versions)
-;; => {::database "3.1.0", ::api "2.0.0"}
+;; => {:myapp/database "2.0.0"
+;;     :myapp/api "1.5.0"
+;;     :myapp/auth "1.0.0"}
+
+;; Or specific modules
+(patch/available-versions :myapp/api :myapp/auth)
+;; => {:myapp/api "1.5.0"
+;;     :myapp/auth "1.0.0"}
 ```
 
-## API Reference
+Expose via HTTP endpoint:
 
-### Protocols
-
-#### `VersionStore`
-Protocol for persisting version state across application restarts.
-
-**Methods:**
-- `(read-version store topic)` - Read the currently installed version for a topic. Returns version string or "0" if not found.
-- `(write-version store topic version)` - Persist the installed version for a topic. Called automatically by `apply` after successful migration.
-
-**Built-in implementations:**
-- `FileVersionStore` - Persists versions to an EDN file
-- `AtomVersionStore` - Stores versions in an atom (in-memory only, for testing)
-
-### Macros
-
-#### `current-version`
 ```clojure
-(current-version topic version-string)
-```
-Defines the current/target version for a topic.
+(defn version-handler [_]
+  {:status 200
+   :body (patch/available-versions)})
 
-#### `installed-version`
-```clojure
-(installed-version topic version-expr)
-```
-Defines the currently installed/deployed version for a topic. Used by the 1-arity `apply` function. Can be a static string or an expression that reads from a VersionStore.
-
-#### `upgrade`
-```clojure
-(upgrade topic version & body)
-```
-Defines code to execute when upgrading TO the specified version.
-
-#### `downgrade`
-```clojure
-(downgrade topic version & body)
-```
-Defines code to execute when downgrading FROM the specified version.
-
-#### `with-store`
-```clojure
-(with-store store & body)
-```
-Execute body with a specific VersionStore bound to `*version-store*`. Overrides any globally registered stores within the scope.
-
-### Functions
-
-#### `apply`
-```clojure
-(apply topic)
-(apply topic current-version)
-(apply topic current-version target-version)
-```
-Applies necessary patches to migrate between versions:
-
-- **1-arity**: Migrates from installed version to current version
-- **2-arity**: Migrates from `current-version` to the topic's current version
-- **3-arity**: Migrates from `current-version` to `target-version`
-
-If `current-version` is nil or "0", starts from the beginning. Automatically determines upgrade vs downgrade direction and executes patches in correct order.
-
-**After successful migration**, if a VersionStore is registered for the topic (via `set-store!` or `*version-store*`), the new version is automatically persisted.
-
-Returns the target version if patches were applied, nil otherwise.
-
-#### `set-store!`
-```clojure
-(set-store! store)
-```
-Set the default VersionStore globally for ALL topics. This store will be used by `apply` to persist version changes. One store tracks versions for all your topics.
-
-#### `available-versions`
-```clojure
-(available-versions)
-(available-versions topic1 topic2 ...)
-```
-Returns a map of topics to their current versions.
-
-#### `registered-topics`
-```clojure
-(registered-topics)
-```
-Returns a set of all registered topics (components with `current-version` defined).
-
-#### `level!`
-```clojure
-(level! topic)
-```
-Apply all pending patches for a component with standardized logging.
-
-This is a convenience wrapper around `apply` that:
-- Reads the installed version from the registered VersionStore
-- Applies all pending patches up to current-version
-- Automatically persists the new version
-- Provides consistent logging across all components
-- Handles missing `installed-version` gracefully (falls back to store or "0")
-
-**Returns**: The target version if patches were applied, nil if already at target.
-
-**Example**:
-```clojure
-;; Instead of writing custom level-X! functions for each component:
-(defn level-iam! []
-  (log/info "[IAM] Leveling...")
-  (patch/apply :synthigy/iam)
-  (log/info "Done"))
-
-;; Just use the generic level! function:
-(patch/level! :synthigy/iam)
-;; [iam] Leveling component from 0.9.0 to 1.0.0...
-;; [iam] Component leveled to 1.0.0
+;; GET /api/versions
+;; => {"myapp/database": "2.0.0", "myapp/api": "1.5.0", ...}
 ```
 
-#### `level-all!`
-```clojure
-(level-all!)
-```
-Level all registered components in registration order.
+This is valuable for:
+- Client compatibility checks
+- Debugging production issues
+- Feature detection
+- Deployment verification
 
-This function discovers all topics that have been registered via `current-version` and levels each one by calling `level!`. Useful for bootstrapping or ensuring all components are up to date.
-
-**Returns**: Map of `{topic version}` for components that were actually updated.
-
-**Example**:
-```clojure
-;; Level all components at once
-(patch/level-all!)
-;; Leveling all registered components...
-;; [iam] Leveling component from 0.9.0 to 1.0.0...
-;; [iam] Component leveled to 1.0.0
-;; [database] Already at version 2.0.0
-;; [audit] Leveling component from 0 to 1.0.0...
-;; [audit] Component leveled to 1.0.0
-;; Leveling complete. Updated 2 component(s)
-;; => {:synthigy/iam "1.0.0" :synthigy/iam-audit "1.0.0"}
-```
-
-#### `->FileVersionStore`
-```clojure
-(->FileVersionStore file-path)
-```
-Creates a file-based VersionStore that persists versions to an EDN file.
-
-#### `->AtomVersionStore`
-```clojure
-(->AtomVersionStore state-atom)
-```
-Creates an atom-based VersionStore for in-memory version tracking (useful for testing).
+---
 
 ## Lifecycle Management
 
-Patcho includes a complementary lifecycle system for runtime module management:
+### The Basics
 
 ```clojure
-(require '[patcho.lifecycle :as lifecycle])
+(ns myapp.cache
+  (:require
+    [patcho.lifecycle :as lifecycle]
+    [patcho.patch :as patch]))
 
-;; Register modules with dependencies
-(lifecycle/register-module! :myapp/database
-  {:start (fn [] (connect!))
-   :stop (fn [] (disconnect!))})
+(patch/current-version :myapp/cache "1.2.0")
+(patch/installed-version :myapp/cache (patch/read-version *db* :myapp/cache))
+
+(patch/upgrade :myapp/cache "1.0.0" (create-cache-tables!))
+(patch/upgrade :myapp/cache "1.2.0" (add-cache-indexes!))
 
 (lifecycle/register-module! :myapp/cache
   {:depends-on [:myapp/database]
-   :setup (fn [] (create-tables!))    ; One-time setup
-   :cleanup (fn [] (drop-tables!))    ; One-time cleanup
-   :start (fn [] (start-cache!))      ; Runtime start
-   :stop (fn [] (stop-cache!))})      ; Runtime stop
 
-;; Start with automatic dependency resolution
-(lifecycle/start! :myapp/cache)
-;; → Starts :myapp/database first, then :myapp/cache
+   ;; Runtime start - level! applies any pending patches
+   :start (fn []
+            (patch/level! :myapp/cache)    ; Apply patches if needed
+            (connect-to-cache!)
+            (start-eviction-thread!))
 
-;; Visualize dependencies
-(lifecycle/print-dependency-tree :myapp/cache)
-;; :myapp/cache
-;; └── :myapp/database
+   ;; Runtime stop
+   :stop (fn []
+           (stop-eviction-thread!)
+           (disconnect!))})
 ```
 
-**Key differences from patcho.patch:**
-- `patcho.patch`: Version migrations (data/schema state transitions)
-- `patcho.lifecycle`: Runtime management (start/stop with dependencies)
+Notice how `level!` fits naturally into `:start`. Each module brings itself to the correct version when it starts. Patches handle schema evolution; lifecycle handles runtime state.
 
-See [Lifecycle Management](docs/lifecycle.md) for the full guide.
+### Starting Modules
 
-## Design Philosophy
+```clojure
+;; Start a module (dependencies start automatically)
+(lifecycle/start! :myapp/api)
+;; → Starts: :myapp/database → :myapp/cache → :myapp/api
+;; → Each module's :start runs level! to apply pending patches
+```
 
-Patcho follows these principles:
+### Stopping Modules
 
-1. **Simplicity**: Minimal API surface - just define versions and migrations
-2. **Safety**: Patches are applied in deterministic order based on semantic versioning
-3. **Flexibility**: Support for both upgrades and downgrades
-4. **Modularity**: Different topics can be versioned independently
+```clojure
+;; Stop is NOT recursive (only stops this module)
+(lifecycle/stop! :myapp/api)
+;; Dependencies stay running—they might be shared
 
-## Common Use Cases
+;; Restart for development
+(lifecycle/restart! :myapp/cache)
+```
 
-- Database schema migrations
-- API version upgrades
-- Configuration format changes
-- Feature flag migrations
-- Data format transformations
+### Visualization
 
-## Best Practices
+```clojure
+(lifecycle/print-dependency-tree :myapp/api)
+;; :myapp/api
+;; ├── :myapp/cache
+;; │   └── :myapp/database
+;; └── :myapp/auth
+;;     └── :myapp/database
 
-1. Always define a current version before defining patches
-2. Make patches idempotent when possible
-3. Test both upgrade and downgrade paths
-4. Use semantic versioning for clear version progression
-5. Group related changes by topic
+(lifecycle/print-system-report)
+;; === System Report ===
+;; Registered: 4 | Started: 2 | Stopped: 2
+;;
+;; [OK] Started modules:
+;;   * :myapp/database
+;;   * :myapp/cache -> [:myapp/database]
+;;
+;; [ ] Stopped modules:
+;;   * :myapp/api -> [:myapp/cache, :myapp/auth]
+```
+
+### Bootstrap Pattern
+
+When your database is itself a lifecycle module and you want to store versions in that database:
+
+```clojure
+;; 1. Start with file-based store (or in-memory for testing)
+(patch/set-store! (patch/->FileVersionStore ".versions"))
+
+;; 2. Start database module (level! runs, creates tables)
+(lifecycle/start! :myapp/database)
+
+;; 3. Switch to database store for subsequent modules
+(patch/set-store! *db*)
+
+;; 4. Continue with other modules (versions now tracked in database)
+(lifecycle/start! :myapp/api)
+```
+
+---
+
+## Documentation
+
+- [Lifecycle Management](docs/lifecycle.md) - Complete lifecycle API reference
+- [Extending Stores](docs/stores.md) - Database-backed persistence (Postgres, SQLite examples)
+
+## Philosophy
+
+**Patches are version transitions, not data pipelines.** They don't receive arguments because migration logic shouldn't depend on caller-provided data. Resources come from the environment—dynamic vars, function calls, protocol implementations. This makes patches reproducible and self-documenting.
+
+**Level fits into start.** Each module brings itself to the correct version when it starts. Patches handle schema evolution; lifecycle handles runtime state. They compose naturally.
+
+**Persistence is required.** Patching depends on knowing what version is installed. Without persistent storage, you can't know which patches to apply. File-based stores work for simple cases; production systems use database-backed stores.
