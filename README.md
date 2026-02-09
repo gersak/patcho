@@ -8,7 +8,7 @@
 
 ## Setup and Start Are Different Things
 
-Creating a database and connecting to it are fundamentally different operations. Setup reads from the environment and creates resources that persist across restarts. Start activates those resources every time your application boots. Patching—applying version migrations—happens during start via `level!`, which reads the installed version from storage and applies any pending patches to reach the current version.
+Creating a database and connecting to it are fundamentally different operations. Setup reads from the environment and creates resources that persist across restarts. Start activates those resources every time your application boots. **Patching—applying version migrations—happens during start via `level!`, which reads the installed version from storage and applies any pending patches to reach the current version.**
 
 [See the full lifecycle →](#the-lifecycle)
 
