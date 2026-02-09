@@ -1,10 +1,10 @@
 (ns build
   (:require
-   [clojure.edn :as edn]
-   [clojure.tools.build.api :as b]
-   [deps-deploy.deps-deploy :as dd]))
+    [clojure.edn :as edn]
+    [clojure.tools.build.api :as b]
+    [deps-deploy.deps-deploy :as dd]))
 
-(def version "0.3.0")
+(def version "0.4.0")
 (def target "target/classes")
 
 (defn create-jar []

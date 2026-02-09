@@ -61,8 +61,12 @@
       ;; └── :my/cache
       ;;     └── :my/database
 
-      ;; Later: stop (NOT recursive - only stops this module)
-      (lifecycle/stop! :my/api)
+      ;; Later: stop (RECURSIVE - stops dependents first)
+      (lifecycle/stop! :my/database)
+      ;; → Stops: :my/api → :my/cache → :my/database
+
+      ;; Surgical stop (only this module)
+      (lifecycle/stop-only! :my/api)
 
       ;; Cleanup (RECURSIVE with reference checking)
       (lifecycle/cleanup! :my/api)
@@ -408,8 +412,9 @@
 ;;; Lifecycle Operations
 ;;; ============================================================================
 
-;; Forward declarations (setup! is defined later but called from start!)
+;; Forward declarations
 (declare setup!)
+(declare get-dependants)
 
 (defn start!
   "Start a module RECURSIVELY (starts all dependencies first).
@@ -462,16 +467,17 @@
    (doseq [t (cons topic more-topics)]
      (start! t))))
 
-(defn stop!
-  "Stop a module (NOT recursive - only stops this module).
+(defn stop-only!
+  "Stop a single module (NOT recursive - only stops this module).
 
   This is idempotent - won't stop if already stopped.
+  Use this for surgical control when you don't want to affect dependents.
 
   Parameters:
     topic - Module keyword
 
   Example:
-    (stop! :my/cache)"
+    (stop-only! :my/api)  ; Only stops :my/api, dependencies stay running"
   [topic]
   (validate-module-exists topic)
   (let [module (get @modules topic)
@@ -480,6 +486,35 @@
     (when started?
       (stop)
       (swap! modules assoc-in [topic :started?] false))))
+
+(defn stop!
+  "Stop a module and all its dependents RECURSIVELY.
+
+  Stop order (dependents first):
+  1. First stop all dependents (modules that depend on this one) - recursively
+  2. Then stop this module
+
+  This ensures no module is left running without its dependencies.
+  This is symmetric with start! (which starts dependencies first).
+
+  This is idempotent - won't stop if already stopped.
+
+  Parameters:
+    topic - Module keyword
+
+  Example:
+    (stop! :my/database)
+    ;; → Stops: :my/api → :my/cache → :my/database (dependents first)"
+  ([topic]
+   (validate-module-exists topic)
+   ;; First, recursively stop all dependents (modules that depend on this one)
+   (doseq [dependant (get-dependants topic)]
+     (stop! dependant))
+   ;; Then stop this module
+   (stop-only! topic))
+  ([topic & more-topics]
+   (doseq [t (cons topic more-topics)]
+     (stop! t))))
 
 (defn- setup-single!
   "Run one-time setup for a single module RECURSIVELY.
@@ -573,7 +608,8 @@
     (cleanup! dependant))
 
   ;; Stop this module before cleanup (must stop before destroying resources)
-  (stop! topic)
+  ;; Use stop-only! since cleanup handles its own recursion
+  (stop-only! topic)
 
   ;; Then cleanup this module (if it has a cleanup function)
   ;; Always run cleanup - it should be idempotent (safe to run multiple times)
@@ -591,8 +627,9 @@
           (catch Exception _ nil))))))
 
 (defn restart!
-  "Restart a module (stop then start).
+  "Restart a module (stop-only then start).
 
+  Uses stop-only! (non-recursive) for surgical control.
   Useful for REPL development when code changes.
 
   Parameters:
@@ -601,7 +638,7 @@
   Example:
     (restart! :my/cache)"
   [topic]
-  (stop! topic)
+  (stop-only! topic)
   (start! topic))
 
 ;;; ============================================================================

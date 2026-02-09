@@ -4,7 +4,7 @@
   <packaging>jar</packaging>
   <groupId>patcho</groupId>
   <artifactId>patcho</artifactId>
-  <version>0.3.0</version>
+  <version>0.4.0</version>
   <name>patcho</name>
   <licenses>
     <license>

@@ -160,24 +160,17 @@
         (patch/apply ::test-range "2.0.0" "3.0.0")
         (is (= ["3.0.0"] @executions))))))
 
-(deftest deployed-version-test
-  (testing "Deployed version functionality"
-    (patch/current-version ::test-deployed "3.0.0")
-    (patch/installed-version ::test-deployed "2.0.0")
-
-    (is (= "2.0.0" (patch/deployed-version ::test-deployed)))
-    (is (= "3.0.0" (patch/version ::test-deployed)))))
-
 (deftest single-arity-apply-test
-  (testing "Single arity apply uses deployed-version"
-    (let [executions (atom [])]
+  (testing "Single arity apply reads installed version from store"
+    (let [store (patch/->AtomVersionStore (atom {::test-single "1.0.0"}))
+          executions (atom [])]
+      (patch/set-store! store)
       (patch/current-version ::test-single "2.0.0")
-      (patch/installed-version ::test-single "1.0.0")
 
       (patch/upgrade ::test-single "2.0.0"
                      (swap! executions conj "2.0.0"))
 
-      ; Should migrate from deployed-version (1.0.0) to current-version (2.0.0)
+      ; Should migrate from store version (1.0.0) to current-version (2.0.0)
       (patch/apply ::test-single)
       (is (= ["2.0.0"] @executions)))))
 
@@ -233,7 +226,6 @@
           executions (atom [])]
       (patch/set-store! store)
       (patch/current-version ::test-with-store "3.0.0")
-      (patch/installed-version ::test-with-store (patch/read-version store ::test-with-store))
 
       (patch/upgrade ::test-with-store "1.0.0"
                      (swap! executions conj "1.0.0"))
@@ -263,8 +255,6 @@
           executions (atom [])]
       (patch/set-store! global-store)
       (patch/current-version ::test-scoped "2.0.0")
-      (patch/installed-version ::test-scoped
-                               (or (patch/read-version global-store ::test-scoped) "0"))
 
       (patch/upgrade ::test-scoped "1.0.0"
                      (swap! executions conj "1.0.0"))
@@ -283,12 +273,12 @@
         (patch/apply ::test-scoped)
         (is (= "2.0.0" (patch/read-version global-store ::test-scoped)))))))
 
-(deftest installed-version-from-store-test
-  (testing "installed-version can read from store dynamically"
+(deftest apply-reads-from-store-test
+  (testing "Apply reads installed version from store"
     (let [store (patch/->AtomVersionStore (atom {::test-dynamic "1.5.0"}))
           executions (atom [])]
+      (patch/set-store! store)
       (patch/current-version ::test-dynamic "3.0.0")
-      (patch/installed-version ::test-dynamic (patch/read-version store ::test-dynamic))
 
       (patch/upgrade ::test-dynamic "2.0.0"
                      (swap! executions conj "2.0.0"))
@@ -296,7 +286,6 @@
                      (swap! executions conj "3.0.0"))
 
       (testing "Reads 1.5.0 from store and migrates to 3.0.0"
-        (patch/set-store! store)
         (patch/apply ::test-dynamic)
         (is (= ["2.0.0" "3.0.0"] @executions))
         (is (= "3.0.0" (patch/read-version store ::test-dynamic)))))))

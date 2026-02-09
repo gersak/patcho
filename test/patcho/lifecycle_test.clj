@@ -297,3 +297,84 @@
       (is (= {:depends-on [:test/cache]
               :dependents []}
              (get graph :test/api))))))
+
+;;; ============================================================================
+;;; Recursive Stop Tests
+;;; ============================================================================
+
+(deftest recursive-stop-test
+  (testing "stop! recursively stops dependents first"
+    (let [stop-order (atom [])]
+      (lifecycle/register-module! :test/database-stop
+                                  {:start (fn [] nil)
+                                   :stop (fn [] (swap! stop-order conj :database))})
+
+      (lifecycle/register-module! :test/cache-stop
+                                  {:depends-on [:test/database-stop]
+                                   :start (fn [] nil)
+                                   :stop (fn [] (swap! stop-order conj :cache))})
+
+      (lifecycle/register-module! :test/api-stop
+                                  {:depends-on [:test/cache-stop]
+                                   :start (fn [] nil)
+                                   :stop (fn [] (swap! stop-order conj :api))})
+
+      ;; Start all modules
+      (lifecycle/start! :test/api-stop)
+      (is (= true (lifecycle/started? :test/database-stop)))
+      (is (= true (lifecycle/started? :test/cache-stop)))
+      (is (= true (lifecycle/started? :test/api-stop)))
+
+      ;; Stop database - should stop api and cache first (dependents)
+      (lifecycle/stop! :test/database-stop)
+
+      ;; Verify stop order: dependents first
+      (is (= [:api :cache :database] @stop-order))
+      (is (= false (lifecycle/started? :test/database-stop)))
+      (is (= false (lifecycle/started? :test/cache-stop)))
+      (is (= false (lifecycle/started? :test/api-stop)))))
+
+  (testing "stop-only! only stops single module (non-recursive)"
+    (let [stop-order (atom [])]
+      (lifecycle/register-module! :test/db-only
+                                  {:start (fn [] nil)
+                                   :stop (fn [] (swap! stop-order conj :database))})
+
+      (lifecycle/register-module! :test/cache-only
+                                  {:depends-on [:test/db-only]
+                                   :start (fn [] nil)
+                                   :stop (fn [] (swap! stop-order conj :cache))})
+
+      ;; Start both modules
+      (lifecycle/start! :test/cache-only)
+      (is (= true (lifecycle/started? :test/db-only)))
+      (is (= true (lifecycle/started? :test/cache-only)))
+
+      ;; stop-only! cache - database stays running
+      (lifecycle/stop-only! :test/cache-only)
+
+      (is (= [:cache] @stop-order))
+      (is (= true (lifecycle/started? :test/db-only)))
+      (is (= false (lifecycle/started? :test/cache-only))))))
+
+(deftest restart-uses-stop-only-test
+  (testing "restart! uses stop-only (non-recursive)"
+    (let [stop-calls (atom [])]
+      (lifecycle/register-module! :test/db-restart
+                                  {:start (fn [] nil)
+                                   :stop (fn [] (swap! stop-calls conj :database))})
+
+      (lifecycle/register-module! :test/cache-restart
+                                  {:depends-on [:test/db-restart]
+                                   :start (fn [] nil)
+                                   :stop (fn [] (swap! stop-calls conj :cache))})
+
+      ;; Start both modules
+      (lifecycle/start! :test/cache-restart)
+
+      ;; Restart cache - should only stop cache, not database
+      (lifecycle/restart! :test/cache-restart)
+
+      (is (= [:cache] @stop-calls))
+      (is (= true (lifecycle/started? :test/db-restart)))
+      (is (= true (lifecycle/started? :test/cache-restart))))))

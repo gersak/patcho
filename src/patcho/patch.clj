@@ -66,25 +66,71 @@
 (def ^:dynamic *version-store*
   "Dynamic var for the version store.
 
-  Defaults to FileVersionStore with `.versions` file.
-  Set globally via set-store!, or temporarily via with-store macro."
-  (->FileVersionStore ".versions"))
+  Defaults to AtomVersionStore (in-memory). State is lost on restart unless
+  you explicitly set a persistent store (FileVersionStore, database, etc.).
+
+  Set globally via set-store!, or temporarily via with-store macro.
+  State is automatically migrated when switching stores."
+  (->AtomVersionStore (atom {})))
+
+
+(declare registered-topics)
+
+(defn migrate-store!
+  "Migrate version state from one store to another.
+
+  Useful for bootstrapping: start with AtomVersionStore, setup database,
+  then migrate state to database-backed store.
+
+  Args:
+    from-store - Source VersionStore to read from
+    to-store   - Destination VersionStore to write to
+    topics     - Collection of topic keywords to migrate (or nil for all registered)
+
+  Returns:
+    Set of migrated topics
+
+  Example:
+    ;; Bootstrap with in-memory store
+    (def bootstrap-store (->AtomVersionStore (atom {})))
+    (set-store! bootstrap-store)
+    (level! :myapp/database)
+
+    ;; Migrate to database store
+    (migrate-store! bootstrap-store *db* nil)
+    (set-store! *db*)"
+  [from-store to-store topics]
+  (let [topics (or topics (registered-topics))]
+    (doseq [topic topics]
+      (let [version (read-version from-store topic)]
+        (when (and version (not= version "0"))
+          (write-version to-store topic version))))
+    (set topics)))
 
 (defn set-store!
   "Set the default version store globally.
 
-  This sets the root binding of *version-store* for all patching operations.
+  Automatically migrates state from the previous store to the new one.
+  This makes store transitions seamless (e.g., from bootstrap AtomVersionStore
+  to database-backed store).
 
   Arguments:
-    store - Implementation of VersionStore protocol
+    store - Implementation of VersionStore protocol (or nil to clear)
 
   Example:
-    (set-store! (->FileVersionStore \".versions\"))
+    ;; Bootstrap with in-memory store (default)
+    (level! :my/database)
 
-    (apply ::my-app)    ; Uses the default store
-    (level! ::my-db)    ; Uses the default store"
+    ;; Switch to DB - state auto-migrates
+    (set-store! *db*)
+
+    (level! :my/app)  ; Uses database store"
   [store]
-  (alter-var-root #'*version-store* (constantly store)))
+  (alter-var-root #'*version-store*
+                  (fn [old-store]
+                    (when (and old-store store (not= old-store store))
+                      (migrate-store! old-store store nil))
+                    store)))
 
 
 (defmacro with-store
@@ -109,17 +155,15 @@
 (defmulti _upgrade (fn [topic to] [topic to]))
 (defmulti _downgrade (fn [topic to] [topic to]))
 (defmulti version (fn [topic] topic))
-(defmulti deployed-version (fn [topic] topic))
 
 (defn apply
   "Applies version patches to migrate from one version to another.
 
-  With 1 arg:  Migrates from deployed-version to the topic's current version.
+  With 1 arg:  Migrates from installed version (read from *version-store*) to current-version.
   With 2 args: Migrates from 'current' to the topic's current version.
   With 3 args: Migrates from 'current' to 'target' version.
 
-  After successful migration, if a VersionStore is registered for this topic
-  (via set-store! or *version-store*), the new version is persisted automatically.
+  After successful migration, the new version is persisted to *version-store*.
 
   Arguments:
     topic   - Keyword identifying the module/component to patch
@@ -130,7 +174,7 @@
     - Determines upgrade vs downgrade direction
     - Finds applicable patches between versions
     - Executes patches in correct order (oldest-first for upgrades, newest-first for downgrades)
-    - Persists the new version to the registered VersionStore (if configured)
+    - Persists the new version to *version-store*
 
   Returns:
     The target version if patches were applied, nil otherwise
@@ -138,16 +182,11 @@
   Example:
     (apply ::my-app \"1.0.0\" \"2.0.0\")  ; Upgrade from 1.0.0 to 2.0.0
     (apply ::my-app \"2.0.0\" \"1.0.0\")  ; Downgrade from 2.0.0 to 1.0.0
-    (apply ::my-app nil)                ; Upgrade from beginning to current"
+    (apply ::my-app)                    ; Upgrade from installed to current"
   ([topic]
-   ;; Handle missing deployed-version gracefully
-   (let [current (try
-                   (deployed-version topic)
-                   (catch IllegalArgumentException _
-                     ;; No installed-version defined, try store or default to "0"
-                     (if *version-store*
-                       (read-version *version-store* topic)
-                       "0")))]
+   (let [current (if *version-store*
+                   (read-version *version-store* topic)
+                   "0")]
      (apply topic current)))
   ([topic current] (apply topic current (version topic)))
   ([topic current target]
@@ -255,32 +294,6 @@
      [~'_]
      ~@body))
 
-(defmacro installed-version
-  "Defines the currently installed/deployed version for a topic.
-
-  This version is used as the starting point when calling apply with only 1 argument.
-  Can be a static version string or a dynamic expression (like reading from a store).
-
-  Arguments:
-    topic - Keyword identifying the module/component
-    body  - Expression(s) that return a version string
-
-  Examples:
-    ; Static version
-    (installed-version ::my-app \"1.5.0\")
-
-    ; Read from a VersionStore
-    (def store (->FileVersionStore \"versions.edn\"))
-    (installed-version ::my-app (read-version store ::my-app))
-
-    ; Read from a file directly
-    (installed-version ::my-app
-      (some-> \"version.txt\" slurp str/trim))"
-  [topic & body]
-  `(defmethod deployed-version ~topic
-     [~'_]
-     ~@body))
-
 (defn available-versions
   "Returns a map of topics to their current versions.
 
@@ -323,47 +336,28 @@
   (set (keys (methods version))))
 
 (defn level!
-  "Apply all pending patches for a component with logging.
+  "Apply all pending patches for a component.
 
-  This is a convenience wrapper around apply that:
-  - Reads the installed version from the registered VersionStore
-  - Applies all pending patches up to current-version
-  - Automatically persists the new version
-  - Provides consistent logging across all components
+  Reads the installed version from *version-store*, applies patches to reach
+  current-version, and persists the new version.
 
   Arguments:
     topic - Keyword identifying the module/component
 
   Returns:
-    The target version if patches were applied, nil otherwise
+    The target version if patches were applied, nil if already at target.
 
   Example:
-    ; Instead of writing custom level-X! functions:
-    (defn level-iam! []
-      (log/info \"[IAM] Leveling...\")
-      (apply :synthigy/iam)
-      (log/info \"Done\"))
-
-    ; Just use:
-    (level! :synthigy/iam)"
+    (level! :myapp/database)"
   ([topic]
-   (let [;; Handle topics that don't have installed-version defined
-         current (try
-                   (deployed-version topic)
-                   (catch IllegalArgumentException _
-                     ;; No installed-version defined, try store or default to "0"
-                     (if *version-store*
-                       (read-version *version-store* topic)
-                       "0")))
+   (let [current (if *version-store*
+                   (read-version *version-store* topic)
+                   "0")
          target (version topic)]
-     ;; Only log and apply if there's actually work to do
-     (if (or (vrs/older? target current)
-             (vrs/newer? target current))
-       (do
-         (apply topic)
-         target)
-       (do
-         nil))))
+     (when (or (vrs/older? target current)
+               (vrs/newer? target current))
+       (apply topic)
+       target)))
   ([topic & more-topics]
    (doseq [t (cons topic more-topics)]
      (level! t))))
