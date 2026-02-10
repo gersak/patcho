@@ -404,7 +404,7 @@
      (level! t))))
 
 
-(current-version :dev.gersak/patcho "0.4.2-SNAPSHOT")
+(current-version :dev.gersak/patcho "0.4.2")
 
 (comment
   (topic-version :dev.gersak/patcho)
