@@ -6,7 +6,7 @@
 
 (def versions
   (let [{:keys [out]} (b/process
-                        {:command-args ["clj" "-T:patcho" "versions" ":require" "patcho.patch"]
+                        {:command-args ["clj" "-X" "patcho.cli/versions" ":require" "patcho.patch"]
                          :out :capture})]
     (edn/read-string out)))
 (def version (:dev.gersak/patcho versions))
@@ -14,7 +14,8 @@
 (def target "target/classes")
 
 (defn create-jar []
-  (let [basis (b/create-basis {})]
+  (let [basis (b/create-basis {})
+        jar-file (format "target/patcho-%s.jar" version)]
     (b/delete {:path "target"})
     (b/copy-dir {:src-dirs ["src"]
                  :target-dir target})
@@ -23,7 +24,7 @@
                   :version version
                   :basis basis})
     (b/jar {:class-dir target
-            :jar-file (format "target/patcho-%s.jar" version)})))
+            :jar-file jar-file})))
 
 (defn release
   ([] (release nil))

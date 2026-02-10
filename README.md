@@ -36,7 +36,6 @@ Patcho works as a Clojure tools.deps tool. Query component versions from the com
 
 [Use Patcho from CLI →](#cli-tool)
 
-
 > [!IMPORTANT]
 > **⚠️ You must configure persistent storage.**
 >
@@ -48,8 +47,6 @@ Patcho works as a Clojure tools.deps tool. Query component versions from the com
 > ```
 >
 > Or use database-backed stores in production. See [Persistent Storage](#persistent-storage) for the full story, including how to handle the chicken-and-egg problem when your database *is* the store.
-
-
 
 ## The Lifecycle
 
@@ -513,34 +510,33 @@ Patcho includes a tools.deps CLI for querying component versions without running
 Add the `:patcho` alias to your `deps.edn`:
 
 ```clojure
-{:deps {dev.gersak/patcho {:mvn/version "0.4.2"}}
- :aliases
- {:patcho {:deps {dev.gersak/patcho {:mvn/version "0.4.2"}}
-           :ns-default patcho.cli}}}
+{:aliases
+ {:patcho {:extra-deps {dev.gersak/patcho {:mvn/version "0.4.2"}}
+           :exec-ns patcho.cli}}}
 ```
 
-The alias duplicates the dependency—this is required because `-T` aliases are isolated from the project's `:deps`.
+Using `-X` with `:extra-deps` means your project's source paths are included automatically—no need to duplicate them.
 
 ### Commands
 
 Get a specific topic's version (plain string, easy to capture in shell):
 
 ```bash
-clj -T:patcho version :topic :myapp/database :require myapp.patches
+clj -X:patcho version :topic :myapp/database :require myapp.patches
 # => 2.0.0
 ```
 
 Get all registered topics and versions (EDN map):
 
 ```bash
-clj -T:patcho versions :require myapp.patches
+clj -X:patcho versions :require myapp.patches
 # => {:myapp/database "2.0.0", :myapp/cache "1.2.0"}
 ```
 
 Get just the topic names (EDN set):
 
 ```bash
-clj -T:patcho topics :require myapp.patches
+clj -X:patcho topics :require myapp.patches
 # => #{:myapp/database :myapp/cache}
 ```
 
@@ -549,7 +545,7 @@ clj -T:patcho topics :require myapp.patches
 If patches are spread across namespaces, require them all:
 
 ```bash
-clj -T:patcho versions :require '[myapp.database.patches myapp.cache.patches]'
+clj -X:patcho versions :require '[myapp.database.patches myapp.cache.patches]'
 ```
 
 ### Programmatic Usage
@@ -562,7 +558,8 @@ Capture output in build scripts or other Clojure code:
 
 (def versions
   (let [{:keys [out]} (b/process
-                        {:command-args ["clj" "-T:patcho" "versions" ":require" "myapp.patches"]
+                        {:command-args ["clj" "-X:patcho" "versions"
+                                        ":require" "myapp.patches"]
                          :out :capture})]
     (edn/read-string out)))
 
@@ -575,7 +572,7 @@ Capture output in build scripts or other Clojure code:
 **CI/CD pipelines** — Check expected versions before deployment:
 
 ```bash
-VERSION=$(clj -T:patcho version :topic :myapp/database :require myapp.patches)
+VERSION=$(clj -X:patcho version :topic :myapp/database :require myapp.patches)
 echo "Deploying database schema version: $VERSION"
 ```
 
@@ -584,12 +581,12 @@ echo "Deploying database schema version: $VERSION"
 ```bash
 for service in api worker scheduler; do
   echo "=== $service ==="
-  clj -T:patcho versions :require ${service}.patches
+  clj -X:patcho versions :require ${service}.patches
 done
 ```
 
 **Pre-flight checks** — Validate patch definitions load without errors:
 
 ```bash
-clj -T:patcho topics :require myapp.patches && echo "Patches OK"
+clj -X:patcho topics :require myapp.patches && echo "Patches OK"
 ```

@@ -1,20 +1,26 @@
 (ns patcho.cli
   "CLI tool functions for querying Patcho topic versions.
 
+  Setup - add to deps.edn:
+    {:aliases
+     {:patcho {:extra-deps {dev.gersak/patcho {:mvn/version \"0.4.2\"}}
+               :exec-ns patcho.cli}}}
+
   Usage:
-    clj -T:patcho version :topic :myapp/database :require myapp.patches
-    clj -T:patcho versions :require myapp.patches
-    clj -T:patcho topics :require myapp.patches
+    clj -X:patcho version :topic :myapp/database :require myapp.patches
+    clj -X:patcho versions :require myapp.patches
+    clj -X:patcho topics :require myapp.patches
 
   The `version` command returns a plain string for easy shell capture:
 
-    VERSION=$(clj -T:patcho version :topic :myapp/database :require myapp.patches)
+    VERSION=$(clj -X:patcho version :topic :myapp/database :require myapp.patches)
 
   The `versions` and `topics` commands return EDN for programmatic use:
 
     (def versions
       (let [{:keys [out]} (b/process
-                            {:command-args [\"clj\" \"-T:patcho\" \"versions\" \":require\" \"myapp.patches\"]
+                            {:command-args [\"clj\" \"-X:patcho\" \"versions\"
+                                            \":require\" \"myapp.patches\"]
                              :out :capture})]
         (edn/read-string out)))"
   (:require

@@ -43,16 +43,17 @@
 
 ;;; Built-in VersionStore implementations
 
-(deftype FileVersionStore [file-path]
-  VersionStore
-  (read-version [_ topic]
-    (try
-      (or (some-> file-path slurp read-string (get topic)) "0")
-      (catch Exception _ "0")))
-  (write-version [_ topic version]
-    (let [current (try (some-> file-path slurp read-string)
-                       (catch Exception _ {}))]
-      (spit file-path (pr-str (assoc current topic version))))))
+#?(:clj
+   (deftype FileVersionStore [file-path]
+     VersionStore
+     (read-version [_ topic]
+       (try
+         (or (some-> file-path slurp read-string (get topic)) "0")
+         (catch Exception _ "0")))
+     (write-version [_ topic version]
+       (let [current (try (some-> file-path slurp read-string)
+                          (catch Exception _ {}))]
+         (spit file-path (pr-str (assoc current topic version)))))))
 
 (deftype AtomVersionStore [state-atom]
   VersionStore
@@ -126,11 +127,17 @@
 
     (level! :my/app)  ; Uses database store"
   [store]
-  (alter-var-root #'*version-store*
-                  (fn [old-store]
-                    (when (and old-store store (not= old-store store))
-                      (migrate-store! old-store store nil))
-                    store)))
+  #?(:clj
+     (alter-var-root #'*version-store*
+                     (fn [old-store]
+                       (when (and old-store store (not= old-store store))
+                         (migrate-store! old-store store nil))
+                       store))
+     :cljs
+     (let [old-store *version-store*]
+       (when (and old-store store (not= old-store store))
+         (migrate-store! old-store store nil))
+       (set! *version-store* store))))
 
 
 (defmacro with-store
@@ -397,7 +404,7 @@
      (level! t))))
 
 
-(current-version :dev.gersak/patcho "0.4.2")
+(current-version :dev.gersak/patcho "0.4.2-SNAPSHOT")
 
 (comment
   (topic-version :dev.gersak/patcho)
