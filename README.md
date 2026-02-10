@@ -30,6 +30,12 @@ Services and HTTP clients need to know what version they're talking to. The `ava
 
 [Expose versions to clients →](#version-awareness)
 
+## Surprising Tool Compatibility
+
+Patcho works as a Clojure tools.deps tool. Query component versions from the command line without starting your application—just require the namespace that defines your patches and ask for versions. CI pipelines, deploy scripts, and ops tooling can check what version a component *should* be before the application even boots.
+
+[Use Patcho from CLI →](#cli-tool)
+
 
 > [!IMPORTANT]
 > **⚠️ You must configure persistent storage.**
@@ -43,7 +49,7 @@ Services and HTTP clients need to know what version they're talking to. The `ava
 >
 > Or use database-backed stores in production. See [Persistent Storage](#persistent-storage) for the full story, including how to handle the chicken-and-egg problem when your database *is* the store.
 
----
+
 
 ## The Lifecycle
 
@@ -228,6 +234,26 @@ Both systems now handle this the same way:
 ```
 
 The in-memory atoms serve as bootstrap storage. When the database module starts and calls `set-store!`, both systems automatically migrate their state to the database. No file-based intermediate step needed.
+
+> [!TIP]
+> **Custom Version Sources**
+>
+> For topics with their own version tracking (e.g., datasets with deploy history), override where installed version comes from:
+>
+> ```clojure
+> ;; Read from dataset's deploy history instead of *version-store*
+> (patch/installed-version :myapp/model
+>   (or (get-deployed-version-from-db) "0"))
+>
+> ;; current-version still defines the target
+> (patch/current-version :myapp/model
+>   (:name (load-model-from-resource)))
+>
+> ;; level! now compares: deploy history → resource version
+> (patch/level! :myapp/model)
+> ```
+>
+> Topics without `installed-version` fall back to `*version-store*`.
 
 ---
 
@@ -474,4 +500,96 @@ See what you're working with:
 ;;
 ;; [ ] Stopped:
 ;;   * :myapp/server -> [:myapp/api, :myapp/cache]
+```
+
+---
+
+## CLI Tool
+
+Patcho includes a tools.deps CLI for querying component versions without running your application.
+
+### Setup
+
+Add the `:patcho` alias to your `deps.edn`:
+
+```clojure
+{:deps {dev.gersak/patcho {:mvn/version "0.4.2"}}
+ :aliases
+ {:patcho {:deps {dev.gersak/patcho {:mvn/version "0.4.2"}}
+           :ns-default patcho.cli}}}
+```
+
+The alias duplicates the dependency—this is required because `-T` aliases are isolated from the project's `:deps`.
+
+### Commands
+
+Get a specific topic's version (plain string, easy to capture in shell):
+
+```bash
+clj -T:patcho version :topic :myapp/database :require myapp.patches
+# => 2.0.0
+```
+
+Get all registered topics and versions (EDN map):
+
+```bash
+clj -T:patcho versions :require myapp.patches
+# => {:myapp/database "2.0.0", :myapp/cache "1.2.0"}
+```
+
+Get just the topic names (EDN set):
+
+```bash
+clj -T:patcho topics :require myapp.patches
+# => #{:myapp/database :myapp/cache}
+```
+
+### Multiple Namespaces
+
+If patches are spread across namespaces, require them all:
+
+```bash
+clj -T:patcho versions :require '[myapp.database.patches myapp.cache.patches]'
+```
+
+### Programmatic Usage
+
+Capture output in build scripts or other Clojure code:
+
+```clojure
+(require '[clojure.tools.build.api :as b]
+         '[clojure.edn :as edn])
+
+(def versions
+  (let [{:keys [out]} (b/process
+                        {:command-args ["clj" "-T:patcho" "versions" ":require" "myapp.patches"]
+                         :out :capture})]
+    (edn/read-string out)))
+
+(def db-version (:myapp/database versions))
+;; => "2.0.0"
+```
+
+### Use Cases
+
+**CI/CD pipelines** — Check expected versions before deployment:
+
+```bash
+VERSION=$(clj -T:patcho version :topic :myapp/database :require myapp.patches)
+echo "Deploying database schema version: $VERSION"
+```
+
+**Ops tooling** — Inventory component versions across services:
+
+```bash
+for service in api worker scheduler; do
+  echo "=== $service ==="
+  clj -T:patcho versions :require ${service}.patches
+done
+```
+
+**Pre-flight checks** — Validate patch definitions load without errors:
+
+```bash
+clj -T:patcho topics :require myapp.patches && echo "Patches OK"
 ```

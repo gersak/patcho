@@ -155,13 +155,24 @@
 (defmulti _upgrade (fn [topic to] [topic to]))
 (defmulti _downgrade (fn [topic to] [topic to]))
 (defmulti version (fn [topic] topic))
+(defmulti deployed-version (fn [topic] topic))
+
+;; Default: read from store
+(defmethod deployed-version :default [topic]
+  (if *version-store*
+    (read-version *version-store* topic)
+    "0"))
 
 (defn apply
   "Applies version patches to migrate from one version to another.
 
-  With 1 arg:  Migrates from installed version (read from *version-store*) to current-version.
+  With 1 arg:  Migrates from deployed-version to current-version.
   With 2 args: Migrates from 'current' to the topic's current version.
   With 3 args: Migrates from 'current' to 'target' version.
+
+  The deployed-version is determined by the deployed-version multimethod,
+  which defaults to reading from *version-store* but can be overridden
+  via the installed-version macro.
 
   After successful migration, the new version is persisted to *version-store*.
 
@@ -184,10 +195,7 @@
     (apply ::my-app \"2.0.0\" \"1.0.0\")  ; Downgrade from 2.0.0 to 1.0.0
     (apply ::my-app)                    ; Upgrade from installed to current"
   ([topic]
-   (let [current (if *version-store*
-                   (read-version *version-store* topic)
-                   "0")]
-     (apply topic current)))
+   (apply topic (deployed-version topic)))
   ([topic current] (apply topic current (version topic)))
   ([topic current target]
    (let [current (or current "0")]
@@ -275,22 +283,45 @@
 
 (defmacro current-version
   "Defines the current/target version for a topic.
-  
+
   This version is used as the default target when calling apply
   with only 2 arguments.
-  
+
   Arguments:
     topic   - Keyword identifying the module/component
     body    - Should return a version string
-    
+
   Example:
     (current-version ::my-app \"2.5.0\")
-    
+
     ; Can also compute version dynamically
-    (current-version ::my-app 
+    (current-version ::my-app
       (read-version-from-file))"
   [topic & body]
   `(defmethod version ~topic
+     [~'_]
+     ~@body))
+
+(defmacro installed-version
+  "Defines where to read the installed/deployed version for a topic.
+
+  Use when the topic has its own version tracking (e.g., dataset deploy history,
+  external system). If not defined, falls back to reading from *version-store*.
+
+  Arguments:
+    topic   - Keyword identifying the module/component
+    body    - Should return a version string (or \"0\" if not installed)
+
+  Example:
+    ; Read from dataset's deploy history instead of version store
+    (installed-version :synthigy.iam/model
+      (or (get-version-from-deploy-history) \"0\"))
+
+    ; Read from external API
+    (installed-version :external/service
+      (fetch-installed-version-from-api))"
+  [topic & body]
+  `(defmethod deployed-version ~topic
      [~'_]
      ~@body))
 
@@ -321,8 +352,12 @@
 
 
 (defn topic-version
+  "Returns the currently deployed/installed version for a topic.
+
+  Uses deployed-version multimethod, which defaults to reading from
+  *version-store* but can be overridden via installed-version macro."
   [topic]
-  (read-version *version-store* topic))
+  (get (available-versions) topic))
 
 (defn registered-topics
   "Returns a set of all registered topics (components with current-version defined).
@@ -338,7 +373,8 @@
 (defn level!
   "Apply all pending patches for a component.
 
-  Reads the installed version from *version-store*, applies patches to reach
+  Reads the installed version via deployed-version (defaults to *version-store*,
+  can be overridden via installed-version macro), applies patches to reach
   current-version, and persists the new version.
 
   Arguments:
@@ -350,9 +386,7 @@
   Example:
     (level! :myapp/database)"
   ([topic]
-   (let [current (if *version-store*
-                   (read-version *version-store* topic)
-                   "0")
+   (let [current (deployed-version topic)
          target (version topic)]
      (when (or (vrs/older? target current)
                (vrs/newer? target current))
@@ -362,7 +396,12 @@
    (doseq [t (cons topic more-topics)]
      (level! t))))
 
+
+(current-version :dev.gersak/patcho "0.4.2")
+
 (comment
+  (topic-version :dev.gersak/patcho)
+  (available-versions :dev.gersak/patcho :synthigy/dataset)
   (vrs/newer? "0" "0.0.0")
   (vrs/older? "0" "0.0.0")
   (available-versions)

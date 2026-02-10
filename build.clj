@@ -4,7 +4,13 @@
     [clojure.tools.build.api :as b]
     [deps-deploy.deps-deploy :as dd]))
 
-(def version "0.4.0")
+(def versions
+  (let [{:keys [out]} (b/process
+                        {:command-args ["clj" "-T:patcho" "versions" ":require" "patcho.patch"]
+                         :out :capture})]
+    (edn/read-string out)))
+(def version (:dev.gersak/patcho versions))
+
 (def target "target/classes")
 
 (defn create-jar []

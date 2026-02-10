@@ -132,13 +132,23 @@
   "Persistent storage for lifecycle state tracking.
 
   Tracks one-time operations (setup, cleanup) across process restarts.
-  Runtime state (started?) is NOT persisted - it's in-memory only."
+
+  IMPORTANT: Only :setup-complete? and :cleanup-complete? should be persisted.
+  The :started? flag is RUNTIME-ONLY state - it must NOT be persisted.
+  This ensures :start functions execute fresh on every JVM restart.
+
+  Implementations SHOULD:
+  - Store only :setup-complete? and :cleanup-complete?
+  - Ignore any :started? key passed to write-lifecycle-state
+  - Never return :started? from read-lifecycle-state"
   (read-lifecycle-state [store topic]
     "Read persistent state for a topic.
-    Returns map with :setup-complete?, :cleanup-complete?, etc.")
+    Returns map with :setup-complete? and :cleanup-complete? only.
+    MUST NOT return :started? - that's runtime-only state.")
   (write-lifecycle-state [store topic state]
     "Write persistent state for a topic.
-    State is a map with :setup-complete?, :cleanup-complete?, etc."))
+    State should only contain :setup-complete? and :cleanup-complete?.
+    Implementations SHOULD ignore :started? if present."))
 
 ;;; ============================================================================
 ;;; File-based LifecycleStore
@@ -163,10 +173,13 @@
 (defrecord FileLifecycleStore [file-path]
   LifecycleStore
   (read-lifecycle-state [_ topic]
-    (get (read-edn-file file-path) topic {}))
+    ;; Filter out :started? in case it was accidentally persisted
+    (dissoc (get (read-edn-file file-path) topic {}) :started?))
   (write-lifecycle-state [_ topic state]
-    (let [current (read-edn-file file-path)
-          updated (assoc current topic state)]
+    ;; Only persist setup/cleanup state, never :started? (runtime-only)
+    (let [persistent-state (select-keys state [:setup-complete? :cleanup-complete?])
+          current (read-edn-file file-path)
+          updated (assoc current topic persistent-state)]
       (write-edn-file file-path updated))))
 
 ;;; ============================================================================
@@ -176,9 +189,12 @@
 (defrecord AtomLifecycleStore [state-atom]
   LifecycleStore
   (read-lifecycle-state [_ topic]
-    (get @state-atom topic {}))
+    ;; Filter out :started? in case it was accidentally stored
+    (dissoc (get @state-atom topic {}) :started?))
   (write-lifecycle-state [_ topic state]
-    (swap! state-atom assoc topic state)))
+    ;; Only persist setup/cleanup state, never :started? (runtime-only)
+    (let [persistent-state (select-keys state [:setup-complete? :cleanup-complete?])]
+      (swap! state-atom assoc topic persistent-state))))
 
 (defn migrate-store!
   "Migrate lifecycle state from one store to another.
@@ -346,22 +362,27 @@
 
   If *lifecycle-store* is set, also includes :setup-complete? and :cleanup-complete?.
 
+  IMPORTANT: :started? is ALWAYS read from in-memory state, never from persistent store.
+  This ensures :start functions run fresh on every JVM restart.
+
   Returns:
     {:depends-on [...]
-     :started? true/false
+     :started? true/false           ; Runtime-only (in-memory)
      :has-setup? true/false
      :has-cleanup? true/false
-     :setup-complete? true/false    ; Only if *lifecycle-store* is set
-     :cleanup-complete? true/false} ; Only if *lifecycle-store* is set"
+     :setup-complete? true/false    ; Persistent (from *lifecycle-store*)
+     :cleanup-complete? true/false} ; Persistent (from *lifecycle-store*)"
   [topic]
   (when-let [module (get @modules topic)]
     (let [base-info {:depends-on (:depends-on module)
                      :started? (:started? module)
                      :has-setup? (some? (:setup module))
                      :has-cleanup? (some? (:cleanup module))}]
-      ;; If a store is configured, include persistent state
       (if *lifecycle-store*
-        (merge base-info (read-lifecycle-state *lifecycle-store* topic))
+        (merge base-info
+               (select-keys
+                 (read-lifecycle-state *lifecycle-store* topic)
+                 [:setup-complete? :cleanup-complete?]))
         base-info))))
 
 
@@ -1041,6 +1062,8 @@
           (println (str "  * " topic " depends on "
                         (str/join ", " missing)
                         " (not registered)")))))))
+
+
 
 
 (comment

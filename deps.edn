@@ -1,2 +1,6 @@
 {:deps {version-clj/version-clj {:mvn/version "2.0.3"}}
- :paths ["src"]}
+ :paths ["src"]
+ :aliases
+ {:patcho {:deps {version-clj/version-clj {:mvn/version "2.0.3"}}
+           :paths ["src"]
+           :ns-default patcho.cli}}}
