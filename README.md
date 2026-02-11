@@ -1,6 +1,6 @@
 # Patcho
 
-**Infrastructure evolves. Patcho tracks what's done and applies what's pending.**
+__Component solved the runtime problem in 2013. Integrant is Component for the data-driven crowd. Patcho asks: **“what about the stuff that happens once?”**__
 
 [![Clojars Project](https://img.shields.io/clojars/v/dev.gersak/patcho.svg)](https://clojars.org/dev.gersak/patcho)
 
