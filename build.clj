@@ -13,7 +13,7 @@
 
 (def target "target/classes")
 
-(defn create-jar []
+(defn create-jar [_]
   (let [basis (b/create-basis {})
         jar-file (format "target/patcho-%s.jar" version)]
     (b/delete {:path "target"})
@@ -22,14 +22,28 @@
     (b/write-pom {:target target
                   :lib 'dev.gersak/patcho
                   :version version
-                  :basis basis})
+                  :basis basis
+                  :src-dirs ["src"]
+                  :scm {:url "https://github.com/gersak/patcho"
+                        :connection "scm:git:git://github.com/gersak/patcho.git"
+                        :developerConnection "scm:git:ssh://git@github.com/gersak/patcho.git"
+                        :tag (str "v" version)}
+                  :pom-data [[:description "Component versioning and lifecycle management for Clojure"]
+                             [:url "https://github.com/gersak/patcho"]
+                             [:licenses
+                              [:license
+                               [:name "MIT"]
+                               [:url "https://opensource.org/licenses/MIT"]]]
+                             [:developers
+                              [:developer
+                               [:name "Robert Gersak"]]]]})
     (b/jar {:class-dir target
             :jar-file jar-file})))
 
 (defn release
   ([] (release nil))
   ([{t :test}]
-   (create-jar)
+   (create-jar nil)
    (let [jar-file (format "target/patcho-%s.jar" version)
          pom-file (str target "/pom.xml")
          installer (if t :local :remote)]
