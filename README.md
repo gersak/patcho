@@ -1,43 +1,47 @@
 # Patcho
 
-*Component solved the runtime problem in 2013. Integrant is Component for the data-driven crowd. Patcho asks: "what about the stuff that happens once?"*
+**Infrastructure evolves. Patcho tracks what's done and applies what's pending.**
 
 [![Clojars Project](https://img.shields.io/clojars/v/dev.gersak/patcho.svg)](https://clojars.org/dev.gersak/patcho)
 
 ---
 
-## Setup and Start Are Different Things
+## The Problem
 
-Creating a database and connecting to it are fundamentally different operations. Setup reads from the environment and creates resources that persist across restarts. Start activates those resources every time your application boots. **Patching—applying version migrations—happens during start via `level!`, which reads the installed version from storage and applies any pending patches to reach the current version.**
+Every serious application needs infrastructure that outlives restarts: databases, tables, Kafka topics, RabbitMQ exchanges, S3 buckets, folder structures. On first deploy, these get created. On subsequent deploys, they get evolved—new columns, new indexes, data migrations, new queues.
 
-[See the full lifecycle →](#the-lifecycle)
+This logic is usually scattered:
+- SQL migration files for the database
+- Shell scripts for message queues
+- Manual ops for cloud storage
+- Custom code for everything else
 
-## You Need Persistent Storage
+And tracking what's been applied? A mix of migration tables, deploy notes, and tribal knowledge.
 
-Without persistent storage, every boot looks like the first boot. Patcho needs to remember what's already been set up and which version is installed. This requires out-of-band storage—a file during development, your database in production—that tracks installed versions and setup state across process restarts.
+## The Solution
 
-[Configure your store →](#persistent-storage)
+Patcho keeps all setup and migration logic in your Clojure code—version controlled, code reviewed, testable. It tracks what's been applied in persistent storage. On every boot, it checks the installed version, applies pending patches in order, and moves on.
 
-## The Dev/Ops Workflow
+```clojure
+(patch/current-version :myapp/database "2.0.0")
 
-On first deploy, setup runs once to create resources from environment variables, then patches migrate from version "0" to current. On subsequent boots, setup is skipped (already done), and patches only apply if the version has changed. When you deploy a new version with schema changes, the patches bring the database up to date automatically.
+(patch/upgrade :myapp/database "1.0.0"
+  (create-tables! [:users :accounts :transactions]))
 
-[See the complete example →](#complete-example)
+(patch/upgrade :myapp/database "1.5.0"
+  (add-index! :transactions :created_at))
 
-## Clients Need Version Awareness
+(patch/upgrade :myapp/database "2.0.0"
+  (add-audit-columns! (all-tables)))
 
-Services and HTTP clients need to know what version they're talking to. The `available-versions` function exposes registered component versions, useful for API endpoints that advertise compatibility and for service-to-service version checks before making requests.
+;; Inside lifecycle :start, after connecting
+(patch/level! :myapp/database)
+```
 
-[Expose versions to clients →](#version-awareness)
-
-## Surprising Tool Compatibility
-
-Patcho works as a Clojure tools.deps tool. Query component versions from the command line without starting your application—just require the namespace that defines your patches and ask for versions. CI pipelines, deploy scripts, and ops tooling can check what version a component *should* be before the application even boots.
-
-[Use Patcho from CLI →](#cli-tool)
+Works for databases. Works for Kafka. Works for S3. Works for anything you can write code for.
 
 > [!IMPORTANT]
-> **⚠️ You must configure persistent storage.**
+> **You must configure persistent storage.**
 >
 > Both patches and lifecycle default to in-memory stores. Without persistence, every boot looks like the first boot—patches rerun, setup repeats. Before your application does anything meaningful, call:
 >
@@ -48,88 +52,349 @@ Patcho works as a Clojure tools.deps tool. Query component versions from the com
 >
 > Or use database-backed stores in production. See [Persistent Storage](#persistent-storage) for the full story, including how to handle the chicken-and-egg problem when your database *is* the store.
 
-## The Lifecycle
+---
 
-Patcho manages five distinct phases:
+## No Arguments, No Problem
 
-| Phase | When | Purpose |
-|-------|------|---------|
-| **Setup** | Once ever | Create from environment/config |
-| **Patches** | Once per version | Evolve the resource |
-| **Start** | Every boot | Activate runtime services |
-| **Stop** | Every shutdown | Deactivate runtime services |
-| **Cleanup** | When removing | Destroy (reverse of setup) |
+[How it works under the hood →](docs/internals.md)
 
-Setup is about *existence*—reading `DATABASE_URL` from the environment and creating the database. Patches are about *evolution*—adding audit columns, creating indexes, running data migrations. These are separate concerns with different timing.
+Patches don't take arguments. This isn't a limitation—it's the point. Patches run once—there's nothing to inject.
 
-The order enforces correctness:
-- Can't patch a database that doesn't exist → **setup first**
-- Can't start something that isn't evolved → **patches after setup**
-- Can't cleanup while running → **stop before cleanup**
+Your database connection comes from `DATABASE_URL`. Your S3 bucket from config. Your Kafka bootstrap servers from environment variables. You're already wiring resources this way with Component, Integrant, Mount, or plain dynamic vars.
 
-Here's a database module showing all phases:
+```clojure
+(patch/upgrade :myapp/storage "1.0.0"
+  (s3/create-bucket! (System/getenv "S3_BUCKET")))
+
+(patch/upgrade :myapp/messaging "1.0.0"
+  (kafka/create-topic! *kafka-admin* "events" {:partitions 12}))
+
+(patch/upgrade :myapp/database "1.5.0"
+  (jdbc/execute! *db* ["CREATE INDEX idx_users_email ON users(email)"]))
+```
+
+Patches read from the same environment your application reads from. The only tracked state is "what version is installed"—and that lives in persistent storage where it survives restarts.
+
+---
+
+## Setup Once, Start Every Boot
+
+[Module lifecycle with dependencies →](#module-lifecycle)
+
+Creating a database and connecting to it are different operations with different timing. Setup runs once ever—creating resources from environment. Start runs every boot—activating those resources. Patches run during start, after the resource is available.
 
 ```clojure
 (lifecycle/register-module! :myapp/database
-  {:depends-on [:myapp/config]
+  {:setup   (fn [] (create-database! (System/getenv "DATABASE_URL")))
+   :start   (fn []
+              (connect!)
+              (patch/level! :myapp/database))  ; patches run here
+   :stop    (fn [] (disconnect!))
+   :cleanup (fn [] (drop-database!))})
+```
 
-   ;; SETUP: Create from environment (runs ONCE, tracked in store)
-   :setup (fn []
-            (let [url (System/getenv "DATABASE_URL")]
-              (log/info "Creating database from environment...")
-              (create-database! url)))
+Lifecycle tracks what's been set up. Patches track what version is installed. Both persist across restarts.
 
-   ;; CLEANUP: Destroy (reverse of setup)
-   :cleanup (fn []
-              (log/info "Dropping database...")
-              (drop-database!))
+---
 
-   ;; START: Connect first, THEN patch, then activate
-   :start (fn []
-            (let [url (System/getenv "DATABASE_URL")]
-              (log/info "Connecting to database...")
-              (alter-var-root #'*db* (constantly (connect url)))
+## Know Your Version at Build Time
 
-              (log/info "Applying pending patches...")
-              (patch/level! :myapp/database)  ; Now we can patch - we're connected!
+Your CI/CD pipeline needs to know what version you're building. Query it without starting the application:
 
-              (log/info "Starting connection pool...")
-              (start-connection-pool!)))
+```bash
+# Get specific component version
+clj -X:patcho version :topic :myapp/database :require myapp.database
+# => 2.0.0
 
-   ;; STOP: Deactivate
-   :stop (fn []
-           (stop-connection-pool!)
-           (disconnect!)
-           (alter-var-root #'*db* (constantly nil)))})
+# Get all registered versions
+clj -X:patcho versions :require myapp.core
+# => {:myapp/database "2.0.0", :myapp/cache "1.2.0", :myapp/api "3.1.0"}
+
+# Combine with your dev alias
+clj -X:dev:patcho version :topic :my.app/dataset :require my.app.core
+clj -X:dev:patcho versions :require my.app.core
+```
+
+The `:require` loads the namespace where `current-version` is declared. That's all that matters—patches don't need to load, just the version declaration.
+
+Add the alias to your `deps.edn`:
+
+```clojure
+{:aliases
+ {:patcho {:extra-deps {dev.gersak/patcho {:mvn/version "0.4.2"}}
+           :ns-default patcho.cli}}}
+```
+
+---
+
+## Know Your Version at Runtime
+
+Service clients need to know what version is running on the other end. Expose it:
+
+```clojure
+(GET "/api/versions" []
+  {:status 200
+   :body (patch/available-versions)})
+;; => {:myapp/database "2.0.0", :myapp/cache "1.2.0"}
+```
+
+Check compatibility before making requests:
+
+```clojure
+(let [versions (http/get "http://service/api/versions")]
+  (when (compatible? (:myapp/api versions))
+    (call-the-api!)))
 ```
 
 ---
 
 ## Persistent Storage
 
-### Why Storage is Required
+Without persistent storage, every boot looks like first boot. Patches rerun. Setup repeats. Chaos.
 
-Patcho tracks two kinds of state:
-- **Installed version** — which version is deployed for each component
-- **Setup state** — which modules have completed one-time setup
+Patcho needs to remember two things:
+- **Installed versions** — which patches have been applied
+- **Lifecycle state** — which modules have completed one-time setup
 
-Without persistence, `level!` would apply all patches on every boot. Without setup tracking, your database would be recreated on every restart.
-
-### Development: File-Based Stores
-
-Both systems default to in-memory `AtomStore` implementations. For development, set file-based stores early in your application:
+For development, use file-based stores:
 
 ```clojure
-;; In your main/init — before any lifecycle or patching operations
 (patch/set-store! (patch/->FileVersionStore ".versions"))
 (lifecycle/set-store! (lifecycle/->FileLifecycleStore ".lifecycle"))
 ```
 
-These create EDN files in your project directory that persist across restarts.
+For production, implement the protocols on your database. State auto-migrates when you switch stores—start with atoms during bootstrap, switch to database after connecting.
 
-### Production: Database-Backed Stores
+[Database-backed stores →](#production-database-backed-stores)
 
-For production, implement the `VersionStore` and `LifecycleStore` protocols on your database type:
+---
+
+## Module Lifecycle
+
+Real applications have dependency graphs. Config loads first. Transit serialization initializes. Then database and storage connect. Finally, the server starts.
+
+```
+:myapp/server
+├── :myapp/database
+│   ├── :myapp/config
+│   └── :myapp/transit
+└── :myapp/storage
+    └── :myapp/config
+```
+
+Patcho's lifecycle system handles this:
+
+```clojure
+;; Foundation modules - no dependencies
+(lifecycle/register-module! :myapp/config
+  {:start (fn [] (load-config!))
+   :stop  (fn [] nil)})
+
+(lifecycle/register-module! :myapp/transit
+  {:start (fn [] (init-transit-handlers!))
+   :stop  (fn [] nil)})
+
+;; Middle tier - depends on foundation
+(lifecycle/register-module! :myapp/database
+  {:depends-on [:myapp/config :myapp/transit]
+   :setup (fn [] (create-database!))
+   :start (fn []
+            (connect-db!)
+            (patch/level! :myapp/database))
+   :stop  (fn [] (disconnect-db!))})
+
+(lifecycle/register-module! :myapp/storage
+  {:depends-on [:myapp/config]
+   :setup (fn [] (create-s3-bucket!))
+   :start (fn []
+            (init-s3-client!)
+            (patch/level! :myapp/storage))
+   :stop  (fn [] (close-s3-client!))})
+
+;; Top level - depends on middle tier
+(lifecycle/register-module! :myapp/server
+  {:depends-on [:myapp/database :myapp/storage]
+   :start (fn [] (start-http-server!))
+   :stop  (fn [] (stop-http-server!))})
+```
+
+### Dependency Resolution
+
+Starting a module starts its dependencies first:
+
+```clojure
+(lifecycle/start! :myapp/server)
+;; Starts: config → transit → database → storage → server
+```
+
+Stopping a module stops its dependents first:
+
+```clojure
+(lifecycle/stop! :myapp/database)
+;; Stops: server → database (storage stays running - different branch)
+```
+
+Visualize what you're working with:
+
+```clojure
+(lifecycle/print-dependency-tree :myapp/server)
+;; :myapp/server
+;; ├── :myapp/database
+;; │   ├── :myapp/config
+;; │   └── :myapp/transit
+;; └── :myapp/storage
+;;     └── :myapp/config
+
+(lifecycle/print-system-report)
+;; === System Report ===
+;; Registered: 5 | Started: 5 | Stopped: 0
+;;
+;; [OK] Started:
+;;   * :myapp/config
+;;   * :myapp/transit
+;;   * :myapp/database -> [:myapp/config, :myapp/transit]
+;;   * :myapp/storage -> [:myapp/config]
+;;   * :myapp/server -> [:myapp/database, :myapp/storage]
+```
+
+---
+
+## Complete Example
+
+A database module with schema evolution, and a cache module that depends on it.
+
+### Database Module
+
+```clojure
+(ns myapp.database
+  (:require
+    [next.jdbc :as jdbc]
+    [patcho.patch :as patch]
+    [patcho.lifecycle :as lifecycle]))
+
+(def ^:dynamic *db* nil)
+
+;; Version declaration
+(patch/current-version :myapp/database "2.0.0")
+
+;; Patches live with the module
+(patch/upgrade :myapp/database "1.0.0"
+  (jdbc/execute! *db* ["CREATE TABLE users (
+                          id SERIAL PRIMARY KEY,
+                          email TEXT UNIQUE NOT NULL,
+                          name TEXT)"]))
+
+(patch/upgrade :myapp/database "1.5.0"
+  (jdbc/execute! *db* ["CREATE INDEX idx_users_email ON users(email)"]))
+
+(patch/upgrade :myapp/database "2.0.0"
+  (jdbc/execute! *db* ["ALTER TABLE users ADD COLUMN created_at TIMESTAMP DEFAULT NOW()"]))
+
+(patch/downgrade :myapp/database "2.0.0"
+  (jdbc/execute! *db* ["ALTER TABLE users DROP COLUMN created_at"]))
+
+;; Lifecycle
+(lifecycle/register-module! :myapp/database
+  {:setup (fn []
+            (let [url (System/getenv "DATABASE_URL")]
+              (create-database-if-not-exists! url)))
+
+   :start (fn []
+            (let [url (System/getenv "DATABASE_URL")]
+              (alter-var-root #'*db* (constantly (jdbc/get-datasource url)))
+              (patch/level! :myapp/database)))
+
+   :stop (fn []
+           (alter-var-root #'*db* (constantly nil)))
+
+   :cleanup (fn []
+              (drop-database! (System/getenv "DATABASE_URL")))})
+```
+
+### Cache Module
+
+```clojure
+(ns myapp.cache
+  (:require
+    [next.jdbc :as jdbc]
+    [patcho.patch :as patch]
+    [patcho.lifecycle :as lifecycle]
+    [myapp.database :refer [*db*]]))
+
+(patch/current-version :myapp/cache "1.1.0")
+
+(patch/upgrade :myapp/cache "1.0.0"
+  (jdbc/execute! *db* ["CREATE TABLE cache_entries (
+                          key TEXT PRIMARY KEY,
+                          value BYTEA,
+                          expires_at TIMESTAMP)"]))
+
+(patch/upgrade :myapp/cache "1.1.0"
+  (jdbc/execute! *db* ["CREATE INDEX idx_cache_expires ON cache_entries(expires_at)"]))
+
+(lifecycle/register-module! :myapp/cache
+  {:depends-on [:myapp/database]  ; database starts first
+
+   :start (fn []
+            (patch/level! :myapp/cache)
+            (start-eviction-thread!))
+
+   :stop (fn []
+           (stop-eviction-thread!))
+
+   :cleanup (fn []
+              (jdbc/execute! *db* ["DROP TABLE IF EXISTS cache_entries"]))})
+```
+
+### Application Entry Point
+
+```clojure
+(ns myapp.core
+  (:require
+    [patcho.patch :as patch]
+    [patcho.lifecycle :as lifecycle]
+    myapp.database
+    myapp.cache
+    myapp.api))
+
+(defn -main [& args]
+  ;; Configure persistent storage
+  (patch/set-store! (patch/->FileVersionStore ".versions"))
+  (lifecycle/set-store! (lifecycle/->FileLifecycleStore ".lifecycle"))
+
+  ;; Start the system
+  ;; → Resolves dependencies
+  ;; → Runs setup for each (if not done)
+  ;; → Starts each (runs patches via level!)
+  (lifecycle/start! :myapp/api))
+```
+
+### What Happens on Boot
+
+**First deploy:**
+1. `setup` runs for database → creates the database
+2. `start` runs for database → connects, runs patches 1.0.0 → 1.5.0 → 2.0.0
+3. `setup` runs for cache → (none defined, skipped)
+4. `start` runs for cache → runs patches 1.0.0 → 1.1.0, starts eviction
+5. API starts
+
+**Subsequent boots (same version):**
+1. `setup` skipped (already done)
+2. `start` runs for database → connects, `level!` finds 2.0.0 = 2.0.0, no patches
+3. `start` runs for cache → `level!` finds 1.1.0 = 1.1.0, no patches
+4. API starts
+
+**Deploy with new cache version (1.2.0):**
+1. `setup` skipped
+2. Database starts, no patches needed
+3. Cache starts, `level!` runs 1.2.0 patch
+4. API starts
+
+---
+
+## Production: Database-Backed Stores
+
+For production, implement `VersionStore` and `LifecycleStore` protocols on your database type:
 
 ```clojure
 (ns myapp.db.postgres
@@ -202,7 +467,7 @@ For production, implement the `VersionStore` and `LifecycleStore` protocols on y
 
 There's a chicken-and-egg problem: you need the database to store state, but you need state storage to set up the database.
 
-Both systems now handle this the same way:
+Both systems handle this the same way:
 - Default to in-memory `AtomStore` (patches and lifecycle)
 - `set-store!` automatically migrates state when switching stores
 
@@ -231,362 +496,3 @@ Both systems now handle this the same way:
 ```
 
 The in-memory atoms serve as bootstrap storage. When the database module starts and calls `set-store!`, both systems automatically migrate their state to the database. No file-based intermediate step needed.
-
-> [!TIP]
-> **Custom Version Sources**
->
-> For topics with their own version tracking (e.g., datasets with deploy history), override where installed version comes from:
->
-> ```clojure
-> ;; Read from dataset's deploy history instead of *version-store*
-> (patch/installed-version :myapp/model
->   (or (get-deployed-version-from-db) "0"))
->
-> ;; current-version still defines the target
-> (patch/current-version :myapp/model
->   (:name (load-model-from-resource)))
->
-> ;; level! now compares: deploy history → resource version
-> (patch/level! :myapp/model)
-> ```
->
-> Topics without `installed-version` fall back to `*version-store*`.
-
----
-
-## Complete Example
-
-Here's a complete example with database and cache modules, showing patches with real SQL:
-
-```clojure
-(ns myapp.database.patch
-  (:require
-    [clojure.tools.logging :as log]
-    [next.jdbc :as jdbc]
-    [patcho.patch :as patch]
-    [myapp.db :refer [*db*]]
-    [myapp.schema :as schema]))
-
-(patch/current-version :myapp/database "2.0.0")
-
-;; 1.0.0 - Initial schema
-(patch/upgrade :myapp/database "1.0.0"
-  (log/info "[DB] Creating initial schema...")
-  (jdbc/with-transaction [tx (:datasource *db*)]
-    (doseq [table [:users :accounts :transactions]]
-      (jdbc/execute! tx [(schema/create-table-sql table)])
-      (log/infof "[DB] Created table: %s" table)))
-  (log/info "[DB] Initial schema complete"))
-
-;; 1.5.0 - Performance indexes
-(patch/upgrade :myapp/database "1.5.0"
-  (log/info "[DB] Adding performance indexes...")
-  (let [indexes [["users" "email" :unique]
-                 ["transactions" "created_at" :btree]
-                 ["transactions" "account_id" :btree]]]
-    (doseq [[table column type] indexes]
-      (jdbc/execute! *db* [(format "CREATE %s INDEX IF NOT EXISTS idx_%s_%s ON %s (%s)"
-                                   (if (= type :unique) "UNIQUE" "")
-                                   table column table column)])
-      (log/infof "[DB] Created index: %s.%s (%s)" table column type))))
-
-;; 2.0.0 - Audit columns on all tables
-(patch/upgrade :myapp/database "2.0.0"
-  (log/info "[DB] Adding audit columns to all entity tables...")
-  (let [tables (schema/get-all-tables *db*)]
-    (jdbc/with-transaction [tx (:datasource *db*)]
-      (doseq [table tables]
-        (jdbc/execute! tx [(format "ALTER TABLE %s ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT NOW()" table)])
-        (jdbc/execute! tx [(format "ALTER TABLE %s ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT NOW()" table)])
-        (jdbc/execute! tx [(format "ALTER TABLE %s ADD COLUMN IF NOT EXISTS created_by BIGINT REFERENCES users(id)" table)])
-
-        ;; Add trigger for updated_at
-        (jdbc/execute! tx [(format "
-          CREATE OR REPLACE TRIGGER update_%s_timestamp
-          BEFORE UPDATE ON %s
-          FOR EACH ROW EXECUTE FUNCTION update_timestamp()" table table)])
-
-        (log/infof "[DB] Added audit columns to: %s" table)))
-
-    ;; Backfill existing records
-    (log/info "[DB] Backfilling audit timestamps for existing records...")
-    (doseq [table tables]
-      (jdbc/execute! tx [(format "UPDATE %s SET created_at = NOW(), updated_at = NOW() WHERE created_at IS NULL" table)])))
-
-  (log/info "[DB] Audit columns migration complete"))
-
-;; Downgrade: rollback 2.0.0
-(patch/downgrade :myapp/database "2.0.0"
-  (log/info "[DB] Rolling back audit columns...")
-  (let [tables (schema/get-all-tables *db*)]
-    (doseq [table tables]
-      (jdbc/execute! *db* [(format "DROP TRIGGER IF EXISTS update_%s_timestamp ON %s" table table)])
-      (jdbc/execute! *db* [(format "ALTER TABLE %s DROP COLUMN IF EXISTS created_at" table)])
-      (jdbc/execute! *db* [(format "ALTER TABLE %s DROP COLUMN IF EXISTS updated_at" table)])
-      (jdbc/execute! *db* [(format "ALTER TABLE %s DROP COLUMN IF EXISTS created_by" table)])))
-  (log/info "[DB] Audit columns rollback complete"))
-```
-
-And a cache module that depends on the database:
-
-```clojure
-(ns myapp.cache
-  (:require
-    [patcho.lifecycle :as lifecycle]
-    [patcho.patch :as patch]
-    [myapp.db :refer [*db*]]))
-
-;; Patches for cache module (uses database connection)
-(patch/current-version :myapp/cache "1.2.0")
-
-(patch/upgrade :myapp/cache "1.0.0"
-  (log/info "[CACHE] Creating cache tables...")
-  (jdbc/execute! *db* ["CREATE TABLE IF NOT EXISTS cache_entries (...)"]))
-
-(patch/upgrade :myapp/cache "1.2.0"
-  (log/info "[CACHE] Adding expiration index...")
-  (jdbc/execute! *db* ["CREATE INDEX idx_cache_expires ON cache_entries (expires_at)"]))
-
-;; Lifecycle registration
-(lifecycle/register-module! :myapp/cache
-  {:depends-on [:myapp/database]  ; Database must be started first!
-
-   :setup (fn []
-            ;; One-time initialization (database already connected via dependency)
-            (log/info "[CACHE] Setting up cache infrastructure...")
-            (patch/level! :myapp/cache))  ; Apply patches - *db* is available
-
-   :cleanup (fn []
-              (log/info "[CACHE] Dropping cache tables...")
-              (jdbc/execute! *db* ["DROP TABLE IF EXISTS cache_entries"]))
-
-   :start (fn []
-            (log/info "[CACHE] Starting cache service...")
-            (start-eviction-thread!))
-
-   :stop (fn []
-           (log/info "[CACHE] Stopping cache service...")
-           (stop-eviction-thread!))})
-```
-
-Starting the cache automatically starts the database first:
-
-```clojure
-(lifecycle/start! :myapp/cache)
-;; 1. Runs setup for :myapp/database (if not done)
-;; 2. Starts :myapp/database
-;; 3. Runs setup for :myapp/cache (if not done)
-;; 4. Starts :myapp/cache
-```
-
----
-
-## Version Awareness
-
-### Exposing Versions
-
-The `available-versions` function returns a map of all registered component versions:
-
-```clojure
-(patch/available-versions)
-;; => {:myapp/database "2.0.0", :myapp/cache "1.2.0", :myapp/api "1.5.0"}
-
-;; Query specific topics
-(patch/available-versions :myapp/database :myapp/api)
-;; => {:myapp/database "2.0.0", :myapp/api "1.5.0"}
-```
-
-### HTTP Endpoint
-
-Expose versions to clients via an API endpoint:
-
-```clojure
-(GET "/api/versions" []
-  {:status 200
-   :body (patch/available-versions)})
-```
-
-Clients can use this to verify compatibility before making requests or to display version information in admin interfaces.
-
-### Service-to-Service Compatibility
-
-When services communicate, they can check versions to ensure compatibility:
-
-```clojure
-(defn compatible? [service-versions]
-  (let [api-version (get service-versions :myapp/api)]
-    (vrs/newer-or-equal? api-version "1.3.0")))
-
-(let [versions (http/get "http://service/api/versions")]
-  (when (compatible? versions)
-    (http/post "http://service/api/data" {...})))
-```
-
----
-
-## Dependency Resolution
-
-### Start is Recursive
-
-Starting a module starts its entire dependency tree:
-
-```clojure
-;; Dependency graph:
-;; :myapp/server
-;; ├── :myapp/api
-;; │   └── :myapp/database
-;; └── :myapp/cache
-;;     └── :myapp/database
-
-(lifecycle/start! :myapp/server)
-;; 1. Runs setup for each (if not done)
-;; 2. Starts: :myapp/database → :myapp/api → :myapp/cache → :myapp/server
-```
-
-### Stop is Recursive (Dependents First)
-
-Stopping a module stops all dependents first:
-
-```clojure
-(lifecycle/stop! :myapp/database)
-;; Stops: :myapp/server → :myapp/api → :myapp/cache → :myapp/database
-```
-
-If you stop the foundation, everything built on it stops.
-
-### Cleanup is Recursive (Dependents First)
-
-Cleanup works the same way—dependents are cleaned before the module itself:
-
-```clojure
-(lifecycle/cleanup! :myapp/database)
-;; Cleans: :myapp/server → :myapp/api → :myapp/cache → :myapp/database
-```
-
-### Surgical Control
-
-For REPL development or targeted restarts, use non-recursive operations:
-
-```clojure
-(lifecycle/stop-only! :myapp/api)
-;; Only stops :myapp/api — dependencies stay running
-
-(lifecycle/restart! :myapp/cache)
-;; stop-only + start — useful for REPL development
-```
-
-### Visualization
-
-See what you're working with:
-
-```clojure
-(lifecycle/print-dependency-tree :myapp/server)
-;; :myapp/server
-;; ├── :myapp/api
-;; │   └── :myapp/database
-;; └── :myapp/cache
-;;     └── :myapp/database
-
-(lifecycle/print-system-report)
-;; === System Report ===
-;; Registered: 4 | Started: 2 | Stopped: 2
-;;
-;; [OK] Started:
-;;   * :myapp/database
-;;   * :myapp/cache -> [:myapp/database]
-;;
-;; [ ] Stopped:
-;;   * :myapp/server -> [:myapp/api, :myapp/cache]
-```
-
----
-
-## CLI Tool
-
-Patcho includes a tools.deps CLI for querying component versions without running your application.
-
-### Setup
-
-Add the `:patcho` alias to your `deps.edn`:
-
-```clojure
-{:aliases
- {:patcho {:extra-deps {dev.gersak/patcho {:mvn/version "0.4.2"}}
-           :exec-ns patcho.cli}}}
-```
-
-Using `-X` with `:extra-deps` means your project's source paths are included automatically—no need to duplicate them.
-
-### Commands
-
-Get a specific topic's version (plain string, easy to capture in shell):
-
-```bash
-clj -X:patcho version :topic :myapp/database :require myapp.patches
-# => 2.0.0
-```
-
-Get all registered topics and versions (EDN map):
-
-```bash
-clj -X:patcho versions :require myapp.patches
-# => {:myapp/database "2.0.0", :myapp/cache "1.2.0"}
-```
-
-Get just the topic names (EDN set):
-
-```bash
-clj -X:patcho topics :require myapp.patches
-# => #{:myapp/database :myapp/cache}
-```
-
-### Multiple Namespaces
-
-If patches are spread across namespaces, require them all:
-
-```bash
-clj -X:patcho versions :require '[myapp.database.patches myapp.cache.patches]'
-```
-
-### Programmatic Usage
-
-Capture output in build scripts or other Clojure code:
-
-```clojure
-(require '[clojure.tools.build.api :as b]
-         '[clojure.edn :as edn])
-
-(def versions
-  (let [{:keys [out]} (b/process
-                        {:command-args ["clj" "-X:patcho" "versions"
-                                        ":require" "myapp.patches"]
-                         :out :capture})]
-    (edn/read-string out)))
-
-(def db-version (:myapp/database versions))
-;; => "2.0.0"
-```
-
-### Use Cases
-
-**CI/CD pipelines** — Check expected versions before deployment:
-
-```bash
-VERSION=$(clj -X:patcho version :topic :myapp/database :require myapp.patches)
-echo "Deploying database schema version: $VERSION"
-```
-
-**Ops tooling** — Inventory component versions across services:
-
-```bash
-for service in api worker scheduler; do
-  echo "=== $service ==="
-  clj -X:patcho versions :require ${service}.patches
-done
-```
-
-**Pre-flight checks** — Validate patch definitions load without errors:
-
-```bash
-clj -X:patcho topics :require myapp.patches && echo "Patches OK"
-```

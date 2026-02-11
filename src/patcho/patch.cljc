@@ -359,10 +359,7 @@
 
 
 (defn topic-version
-  "Returns the currently deployed/installed version for a topic.
-
-  Uses deployed-version multimethod, which defaults to reading from
-  *version-store* but can be overridden via installed-version macro."
+  "Returns the currently deployed/installed version for a topic."
   [topic]
   (get (available-versions) topic))
 
